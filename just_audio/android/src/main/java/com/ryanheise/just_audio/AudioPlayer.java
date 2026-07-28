@@ -69,6 +69,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
+import java.util.UUID;
 
 public class AudioPlayer implements MethodCallHandler, Player.Listener, MetadataOutput {
     public static final int ERROR_ABORT = 10000000;
@@ -101,9 +102,23 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
     private LivePlaybackSpeedControl livePlaybackSpeedControl;
     private List<Object> rawAudioEffects;
     private List<AudioEffect> audioEffects = new ArrayList<AudioEffect>();
-    private Map<String, AudioEffect> audioEffectsMap = new HashMap<String, AudioEffect>();
+    private Map<String, AudioEffectState> audioEffectStates = new HashMap<String, AudioEffectState>();
     private int lastPlaylistLength = 0;
     private Map<String, Object> pendingPlaybackEvent;
+
+    private static class AudioEffectState {
+        final AudioEffect effect;
+        boolean available;
+        boolean enabled;
+        String errorMessage;
+
+        AudioEffectState(AudioEffect effect, boolean available, boolean enabled, String errorMessage) {
+            this.effect = effect;
+            this.available = available;
+            this.enabled = enabled;
+            this.errorMessage = errorMessage;
+        }
+    }
 
     private ExoPlayer player;
     private Integer audioSessionId;
@@ -221,15 +236,39 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
             this.audioSessionId = audioSessionId;
         }
         clearAudioEffects();
+        audioEffectStates.clear();
         if (this.audioSessionId != null) {
             for (Object rawAudioEffect : rawAudioEffects) {
                 Map<?, ?> json = (Map<?, ?>)rawAudioEffect;
-                AudioEffect audioEffect = decodeAudioEffect(rawAudioEffect, this.audioSessionId);
-                if ((Boolean)json.get("enabled")) {
-                    audioEffect.setEnabled(true);
+                String type = (String)json.get("type");
+                AudioEffect audioEffect = null;
+                try {
+                    audioEffect = decodeAudioEffect(rawAudioEffect, this.audioSessionId);
+                    boolean requestedEnabled = Boolean.TRUE.equals(json.get("enabled"));
+                    if (requestedEnabled) {
+                        final int status = audioEffect.setEnabled(true);
+                        if (status != AudioEffect.SUCCESS) {
+                            throw new RuntimeException("setEnabled returned " + status);
+                        }
+                    }
+                    audioEffects.add(audioEffect);
+                    audioEffectStates.put(type, new AudioEffectState(
+                        audioEffect,
+                        true,
+                        requestedEnabled,
+                        null
+                    ));
+                } catch (RuntimeException e) {
+                    if (audioEffect != null) {
+                        try {
+                            audioEffect.release();
+                        } catch (RuntimeException ignored) {
+                        }
+                    }
+                    final String message = e.getMessage() == null ? e.toString() : e.getMessage();
+                    audioEffectStates.put(type, new AudioEffectState(null, false, false, message));
+                    Log.w(TAG, "Unable to initialize audio effect " + type + ": " + message);
                 }
-                audioEffects.add(audioEffect);
-                audioEffectsMap.put((String)json.get("type"), audioEffect);
             }
         }
         enqueuePlaybackEvent();
@@ -536,19 +575,19 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
                 result.success(new HashMap<String, Object>());
                 break;
             case "audioEffectSetEnabled":
-                audioEffectSetEnabled(call.argument("type"), call.argument("enabled"));
-                result.success(new HashMap<String, Object>());
+                result.success(audioEffectSetEnabled(call.argument("type"), call.argument("enabled")));
+                break;
+            case "audioEffectGetStatus":
+                result.success(audioEffectGetStatus(call.argument("type"), call.argument("enabled")));
                 break;
             case "androidLoudnessEnhancerSetTargetGain":
-                loudnessEnhancerSetTargetGain(call.argument("targetGain"));
-                result.success(new HashMap<String, Object>());
+                result.success(loudnessEnhancerSetTargetGain(call.argument("targetGain")));
                 break;
             case "androidEqualizerGetParameters":
                 result.success(equalizerAudioEffectGetParameters());
                 break;
             case "androidEqualizerBandSetGain":
-                equalizerBandSetGain(call.argument("bandIndex"), call.argument("gain"));
-                result.success(new HashMap<String, Object>());
+                result.success(equalizerBandSetGain(call.argument("bandIndex"), call.argument("gain")));
                 break;
             default:
                 result.notImplemented();
@@ -707,11 +746,13 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
         case "AndroidLoudnessEnhancer":
             if (Build.VERSION.SDK_INT < 19)
                 throw new RuntimeException("AndroidLoudnessEnhancer requires minSdkVersion >= 19");
+            ensureEffectTypeAvailable(AudioEffect.EFFECT_TYPE_LOUDNESS_ENHANCER, type);
             int targetGain = (int)Math.round((((Double)map.get("targetGain")) * 100.0)); // target gain needs to be provided in milliBel, the user provides the value in deciBel
             LoudnessEnhancer loudnessEnhancer = new LoudnessEnhancer(audioSessionId);
             loudnessEnhancer.setTargetGain(targetGain);
             return loudnessEnhancer;
         case "AndroidEqualizer":
+            ensureEffectTypeAvailable(AudioEffect.EFFECT_TYPE_EQUALIZER, type);
             Equalizer equalizer = new Equalizer(0, audioSessionId);
             return equalizer;
         default:
@@ -719,13 +760,30 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
         }
     }
 
+    private void ensureEffectTypeAvailable(UUID effectType, String effectName) {
+        AudioEffect.Descriptor[] descriptors = AudioEffect.queryEffects();
+        if (descriptors == null) {
+            throw new RuntimeException("No Android audio effects are available");
+        }
+        for (AudioEffect.Descriptor descriptor : descriptors) {
+            if (effectType.equals(descriptor.type)) {
+                return;
+            }
+        }
+        throw new RuntimeException("Android audio effect is not advertised: " + effectName);
+    }
+
     private void clearAudioEffects() {
         for (Iterator<AudioEffect> it = audioEffects.iterator(); it.hasNext();) {
             AudioEffect audioEffect = it.next();
-            audioEffect.release();
+            try {
+                audioEffect.release();
+            } catch (RuntimeException e) {
+                Log.w(TAG, "Unable to release audio effect: " + e.getMessage());
+            }
             it.remove();
         }
-        audioEffectsMap.clear();
+        audioEffectStates.clear();
     }
 
     private DataSource.Factory buildDataSourceFactory(Map<?, ?> headers) {
@@ -819,38 +877,122 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
         }
     }
 
-    private void audioEffectSetEnabled(String type, boolean enabled) {
-        audioEffectsMap.get(type).setEnabled(enabled);
+    private Map<String, Object> audioEffectSetEnabled(String type, boolean enabled) {
+        AudioEffectState state = audioEffectStates.get(type);
+        if (state == null || !state.available || state.effect == null) {
+            return audioEffectStatusMap(state);
+        }
+        try {
+            final int status = state.effect.setEnabled(enabled);
+            if (status != AudioEffect.SUCCESS) {
+                throw new RuntimeException("setEnabled returned " + status);
+            }
+            state.enabled = enabled;
+            state.errorMessage = null;
+        } catch (RuntimeException e) {
+            markAudioEffectUnavailable(type, state, e);
+        }
+        return audioEffectStatusMap(state);
     }
 
-    private void loudnessEnhancerSetTargetGain(double targetGain) {
+    private Map<String, Object> audioEffectGetStatus(String type, boolean requestedEnabled) {
+        AudioEffectState state = audioEffectStates.get(type);
+        if (state == null) {
+            return mapOf(
+                "available", false,
+                "enabled", false,
+                "errorMessage", "Audio effect is not initialized"
+            );
+        }
+        if (!state.available) {
+            return audioEffectStatusMap(state);
+        }
+        try {
+            state.enabled = state.effect != null && state.effect.getEnabled();
+        } catch (RuntimeException e) {
+            markAudioEffectUnavailable(type, state, e);
+        }
+        return audioEffectStatusMap(state);
+    }
+
+    private Map<String, Object> loudnessEnhancerSetTargetGain(double targetGain) {
+        AudioEffectState state = audioEffectStates.get("AndroidLoudnessEnhancer");
+        if (state == null || !state.available || !(state.effect instanceof LoudnessEnhancer)) {
+            return audioEffectStatusMap(state);
+        }
         int targetGainMillibels = (int)Math.round(targetGain * 100.0); // target gain needs to be provided in milliBel, the user provides the value in deciBel
-        ((LoudnessEnhancer)audioEffectsMap.get("AndroidLoudnessEnhancer")).setTargetGain(targetGainMillibels);
+        try {
+            ((LoudnessEnhancer)state.effect).setTargetGain(targetGainMillibels);
+        } catch (RuntimeException e) {
+            markAudioEffectUnavailable("AndroidLoudnessEnhancer", state, e);
+        }
+        return audioEffectStatusMap(state);
     }
 
     private Map<String, Object> equalizerAudioEffectGetParameters() {
-        Equalizer equalizer = (Equalizer)audioEffectsMap.get("AndroidEqualizer");
-        ArrayList<Object> rawBands = new ArrayList<>();
-        for (short i = 0; i < equalizer.getNumberOfBands(); i++) {
-            rawBands.add(mapOf(
-                "index", i,
-                "lowerFrequency", (double)equalizer.getBandFreqRange(i)[0] / 1000.0, // returns a value in milliHertz, we want Hertz
-                "upperFrequency", (double)equalizer.getBandFreqRange(i)[1] / 1000.0, // returns a value in milliHertz, we want Hertz
-                "centerFrequency", (double)equalizer.getCenterFreq(i) / 1000.0, // returns a value in milliHertz, we want Hertz
-                "gain", equalizer.getBandLevel(i) / 100.0 // returns a value in milliBel, we want deciBel
-            ));
+        AudioEffectState state = audioEffectStates.get("AndroidEqualizer");
+        if (state == null || !state.available || !(state.effect instanceof Equalizer)) {
+            return audioEffectStatusMap(state);
         }
-        return mapOf(
-            "parameters", mapOf(
-                "minDecibels", equalizer.getBandLevelRange()[0] / 100.0, // returns a value in milliBel, we want deciBel
-                "maxDecibels", equalizer.getBandLevelRange()[1] / 100.0, // returns a value in milliBel, we want deciBel
-                "bands", rawBands
-            )
-        );
+        try {
+            Equalizer equalizer = (Equalizer)state.effect;
+            ArrayList<Object> rawBands = new ArrayList<>();
+            for (short i = 0; i < equalizer.getNumberOfBands(); i++) {
+                rawBands.add(mapOf(
+                    "index", i,
+                    "lowerFrequency", (double)equalizer.getBandFreqRange(i)[0] / 1000.0, // returns a value in milliHertz, we want Hertz
+                    "upperFrequency", (double)equalizer.getBandFreqRange(i)[1] / 1000.0, // returns a value in milliHertz, we want Hertz
+                    "centerFrequency", (double)equalizer.getCenterFreq(i) / 1000.0, // returns a value in milliHertz, we want Hertz
+                    "gain", equalizer.getBandLevel(i) / 100.0 // returns a value in milliBel, we want deciBel
+                ));
+            }
+            return mapOf(
+                "available", true,
+                "parameters", mapOf(
+                    "minDecibels", equalizer.getBandLevelRange()[0] / 100.0, // returns a value in milliBel, we want deciBel
+                    "maxDecibels", equalizer.getBandLevelRange()[1] / 100.0, // returns a value in milliBel, we want deciBel
+                    "bands", rawBands
+                )
+            );
+        } catch (RuntimeException e) {
+            markAudioEffectUnavailable("AndroidEqualizer", state, e);
+            return audioEffectStatusMap(state);
+        }
     }
 
-    private void equalizerBandSetGain(int bandIndex, double gain) {
-        ((Equalizer)audioEffectsMap.get("AndroidEqualizer")).setBandLevel((short)bandIndex, (short)(Math.round(gain * 100.0))); // target gain needs to be provided in milliBel, the user provides the value in deciBel
+    private Map<String, Object> equalizerBandSetGain(int bandIndex, double gain) {
+        AudioEffectState state = audioEffectStates.get("AndroidEqualizer");
+        if (state == null || !state.available || !(state.effect instanceof Equalizer)) {
+            return audioEffectStatusMap(state);
+        }
+        try {
+            ((Equalizer)state.effect).setBandLevel((short)bandIndex, (short)(Math.round(gain * 100.0))); // target gain needs to be provided in milliBel, the user provides the value in deciBel
+        } catch (RuntimeException e) {
+            markAudioEffectUnavailable("AndroidEqualizer", state, e);
+        }
+        return audioEffectStatusMap(state);
+    }
+
+    private void markAudioEffectUnavailable(String type, AudioEffectState state, RuntimeException error) {
+        state.available = false;
+        state.enabled = false;
+        state.errorMessage = error.getMessage() == null ? error.toString() : error.getMessage();
+        Log.w(TAG, "Audio effect became unavailable " + type + ": " + state.errorMessage);
+    }
+
+    private Map<String, Object> audioEffectStatusMap(AudioEffectState state) {
+        if (state == null) {
+            return mapOf(
+                "available", false,
+                "enabled", false,
+                "errorMessage", "Audio effect is not initialized"
+            );
+        }
+        return mapOf(
+            "available", state.available,
+            "enabled", state.enabled,
+            "errorMessage", state.errorMessage
+        );
     }
 
     /// Creates an event based on the current state.

@@ -4348,6 +4348,7 @@ class AudioPipeline {
 abstract class AudioEffect {
   AudioPlayer? _player;
   final _enabledSubject = BehaviorSubject.seeded(false);
+  final _statusSubject = BehaviorSubject.seeded(AudioEffectStatus.unknown);
 
   AudioEffect();
 
@@ -4358,7 +4359,15 @@ abstract class AudioEffect {
   }
 
   /// Called when [_player] is connected to the platform.
-  Future<void> _activate(AudioPlayerPlatform platform) async {}
+  Future<void> _activate(AudioPlayerPlatform platform) async {
+    if (this is AndroidAudioEffect && (_isAndroid() || _isUnitTest())) {
+      try {
+        await _refreshStatus(platform);
+      } catch (error) {
+        _setUnavailable(error);
+      }
+    }
+  }
 
   /// Whether the effect is enabled. When `true`, and if the effect is part
   /// of an [AudioPipeline] attached to an [AudioPlayer], the effect will modify
@@ -4369,16 +4378,71 @@ abstract class AudioEffect {
   /// A stream of the current [enabled] value.
   Stream<bool> get enabledStream => _enabledSubject.stream;
 
+  /// The most recently reported native status of this effect.
+  AudioEffectStatus get status => _statusSubject.nvalue!;
+
+  /// A stream of native effect status changes.
+  Stream<AudioEffectStatus> get statusStream => _statusSubject.stream;
+
   bool get _active => _player?._active ?? false;
 
   String get _type;
+
+  /// Refreshes this effect's native availability and enabled state.
+  Future<AudioEffectStatus> refreshStatus() async {
+    final player = _player;
+    if (player == null || !player._active) return status;
+    try {
+      return _refreshStatus(await player._platform);
+    } catch (error) {
+      _setUnavailable(error);
+      return status;
+    }
+  }
+
+  Future<AudioEffectStatus> _refreshStatus(AudioPlayerPlatform platform) async {
+    final response = await platform.audioEffectGetStatus(
+      AudioEffectStatusRequest(type: _type, enabled: enabled),
+    );
+    final nextStatus = AudioEffectStatus(
+      availability: response.available
+          ? AudioEffectAvailability.available
+          : AudioEffectAvailability.unavailable,
+      enabled: response.enabled,
+      errorMessage: response.errorMessage,
+    );
+    _statusSubject.add(nextStatus);
+    _enabledSubject.add(response.enabled);
+    return nextStatus;
+  }
+
+  void _setUnavailable(Object error) {
+    _statusSubject.add(AudioEffectStatus(
+      availability: AudioEffectAvailability.unavailable,
+      enabled: false,
+      errorMessage: error.toString(),
+    ));
+    _enabledSubject.add(false);
+  }
 
   /// Sets the [enabled] status of this audio effect.
   Future<void> setEnabled(bool enabled) async {
     _enabledSubject.add(enabled);
     if (_active) {
-      await (await _player!._platform).audioEffectSetEnabled(
-          AudioEffectSetEnabledRequest(type: _type, enabled: enabled));
+      try {
+        final response = await (await _player!._platform).audioEffectSetEnabled(
+            AudioEffectSetEnabledRequest(type: _type, enabled: enabled));
+        _statusSubject.add(AudioEffectStatus(
+          availability: response.available
+              ? AudioEffectAvailability.available
+              : AudioEffectAvailability.unavailable,
+          enabled: response.enabled ?? enabled,
+          errorMessage: response.errorMessage,
+        ));
+        _enabledSubject.add(response.enabled ?? enabled);
+      } catch (error) {
+        _setUnavailable(error);
+      }
     }
   }
 
@@ -4390,6 +4454,27 @@ mixin AndroidAudioEffect on AudioEffect {}
 
 /// An [AudioEffect] that supports iOS and macOS.
 mixin DarwinAudioEffect on AudioEffect {}
+
+enum AudioEffectAvailability { unknown, available, unavailable }
+
+class AudioEffectStatus {
+  static const unknown = AudioEffectStatus(
+    availability: AudioEffectAvailability.unknown,
+    enabled: false,
+  );
+
+  final AudioEffectAvailability availability;
+  final bool enabled;
+  final String? errorMessage;
+
+  const AudioEffectStatus({
+    required this.availability,
+    required this.enabled,
+    this.errorMessage,
+  });
+
+  bool get isAvailable => availability == AudioEffectAvailability.available;
+}
 
 /// An Android [AudioEffect] that boosts the volume of the audio signal to a
 /// target gain, which defaults to zero.
@@ -4409,8 +4494,21 @@ class AndroidLoudnessEnhancer extends AudioEffect with AndroidAudioEffect {
   Future<void> setTargetGain(double targetGain) async {
     _targetGainSubject.add(targetGain);
     if (_active) {
-      await (await _player!._platform).androidLoudnessEnhancerSetTargetGain(
-          AndroidLoudnessEnhancerSetTargetGainRequest(targetGain: targetGain));
+      try {
+        final response = await (await _player!._platform)
+            .androidLoudnessEnhancerSetTargetGain(
+                AndroidLoudnessEnhancerSetTargetGainRequest(
+                    targetGain: targetGain));
+        _statusSubject.add(AudioEffectStatus(
+          availability: response.available
+              ? AudioEffectAvailability.available
+              : AudioEffectAvailability.unavailable,
+          enabled: response.enabled ?? status.enabled,
+          errorMessage: response.errorMessage,
+        ));
+      } catch (error) {
+        _setUnavailable(error);
+      }
     }
   }
 
@@ -4530,14 +4628,26 @@ class AndroidEqualizer extends AudioEffect with AndroidAudioEffect {
   @override
   Future<void> _activate(AudioPlayerPlatform platform) async {
     await super._activate(platform);
+    if (!status.isAvailable) return;
     if (_parametersCompleter.isCompleted) {
       await (await parameters)._restore(platform);
       return;
     }
     final response = await platform
         .androidEqualizerGetParameters(AndroidEqualizerGetParametersRequest());
-    final receivedParameters =
-        AndroidEqualizerParameters._fromMessage(_player!, response.parameters);
+    if (!response.available || response.parameters == null) {
+      _statusSubject.add(AudioEffectStatus(
+        availability: AudioEffectAvailability.unavailable,
+        enabled: false,
+        errorMessage: response.errorMessage,
+      ));
+      _enabledSubject.add(false);
+      return;
+    }
+    final receivedParameters = AndroidEqualizerParameters._fromMessage(
+      _player!,
+      response.parameters!,
+    );
     _parametersCompleter.complete(receivedParameters);
   }
 

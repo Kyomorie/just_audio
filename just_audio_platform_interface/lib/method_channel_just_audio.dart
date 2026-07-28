@@ -208,6 +208,14 @@ class MethodChannelAudioPlayer extends AudioPlayerPlatform {
   }
 
   @override
+  Future<AudioEffectStatusResponse> audioEffectGetStatus(
+      AudioEffectStatusRequest request) async {
+    return AudioEffectStatusResponse.fromMap(
+        (await _channel.invokeMethod<Map<dynamic, dynamic>>(
+            'audioEffectGetStatus', request.toMap()))!);
+  }
+
+  @override
   Future<AndroidLoudnessEnhancerSetTargetGainResponse>
       androidLoudnessEnhancerSetTargetGain(
           AndroidLoudnessEnhancerSetTargetGainRequest request) async {

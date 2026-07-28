@@ -325,6 +325,11 @@ class _JustAudioPlayer extends AudioPlayerPlatform {
       _playerAudioHandler.customAudioEffectSetEnabled(request);
 
   @override
+  Future<AudioEffectStatusResponse> audioEffectGetStatus(
+          AudioEffectStatusRequest request) =>
+      _playerAudioHandler.customAudioEffectGetStatus(request);
+
+  @override
   Future<SetAllowsExternalPlaybackResponse> setAllowsExternalPlayback(
           SetAllowsExternalPlaybackRequest request) =>
       _playerAudioHandler.customSetAllowsExternalPlayback(request);
@@ -552,6 +557,10 @@ class _PlayerAudioHandler extends BaseAudioHandler
   Future<AudioEffectSetEnabledResponse> customAudioEffectSetEnabled(
           AudioEffectSetEnabledRequest request) async =>
       await (await _player).audioEffectSetEnabled(request);
+
+  Future<AudioEffectStatusResponse> customAudioEffectGetStatus(
+          AudioEffectStatusRequest request) async =>
+      await (await _player).audioEffectGetStatus(request);
 
   Future<SetAllowsExternalPlaybackResponse> customSetAllowsExternalPlayback(
           SetAllowsExternalPlaybackRequest request) async =>

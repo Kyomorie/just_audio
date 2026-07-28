@@ -209,6 +209,15 @@ abstract class AudioPlayerPlatform {
         "audioEffectSetEnabled() has not been implemented.");
   }
 
+  /// Gets the availability and native enabled state of an audio effect.
+  Future<AudioEffectStatusResponse> audioEffectGetStatus(
+      AudioEffectStatusRequest request) {
+    return Future.value(AudioEffectStatusResponse(
+      available: true,
+      enabled: request.enabled,
+    ));
+  }
+
   /// Sets the target gain on the Android loudness enhancer.
   Future<AndroidLoudnessEnhancerSetTargetGainResponse>
       androidLoudnessEnhancerSetTargetGain(
@@ -1334,11 +1343,63 @@ class AudioEffectSetEnabledRequest {
       };
 }
 
+/// Information communicated to the platform implementation when requesting
+/// the status of an audio effect.
+class AudioEffectStatusRequest {
+  final String type;
+  final bool enabled;
+
+  AudioEffectStatusRequest({
+    required this.type,
+    required this.enabled,
+  });
+
+  Map<dynamic, dynamic> toMap() => <dynamic, dynamic>{
+        'type': type,
+        'enabled': enabled,
+      };
+}
+
+/// Information returned by the platform implementation when querying an
+/// audio effect.
+class AudioEffectStatusResponse {
+  final bool available;
+  final bool enabled;
+  final String? errorMessage;
+
+  AudioEffectStatusResponse({
+    required this.available,
+    required this.enabled,
+    this.errorMessage,
+  });
+
+  static AudioEffectStatusResponse fromMap(Map<dynamic, dynamic> map) =>
+      AudioEffectStatusResponse(
+        available: map['available'] as bool? ?? false,
+        enabled: map['enabled'] as bool? ?? false,
+        errorMessage: map['errorMessage'] as String?,
+      );
+}
+
 /// Information returned by the platform implementation after setting the
 /// enabled status of an audio effect.
 class AudioEffectSetEnabledResponse {
+  final bool available;
+  final bool? enabled;
+  final String? errorMessage;
+
+  AudioEffectSetEnabledResponse({
+    this.available = true,
+    this.enabled,
+    this.errorMessage,
+  });
+
   static AudioEffectSetEnabledResponse fromMap(Map<dynamic, dynamic> map) =>
-      AudioEffectSetEnabledResponse();
+      AudioEffectSetEnabledResponse(
+        available: map['available'] as bool? ?? true,
+        enabled: map['enabled'] as bool?,
+        errorMessage: map['errorMessage'] as String?,
+      );
 }
 
 /// Information communicated to the platform implementation when setting the
@@ -1359,9 +1420,23 @@ class AndroidLoudnessEnhancerSetTargetGainRequest {
 /// Information returned by the platform implementation after setting the target
 /// gain on the loudness enhancer audio effect.
 class AndroidLoudnessEnhancerSetTargetGainResponse {
+  final bool available;
+  final bool? enabled;
+  final String? errorMessage;
+
+  AndroidLoudnessEnhancerSetTargetGainResponse({
+    this.available = true,
+    this.enabled,
+    this.errorMessage,
+  });
+
   static AndroidLoudnessEnhancerSetTargetGainResponse fromMap(
           Map<dynamic, dynamic> map) =>
-      AndroidLoudnessEnhancerSetTargetGainResponse();
+      AndroidLoudnessEnhancerSetTargetGainResponse(
+        available: map['available'] as bool? ?? true,
+        enabled: map['enabled'] as bool?,
+        errorMessage: map['errorMessage'] as String?,
+      );
 }
 
 /// Information communicated to the platform implementation when requesting the
@@ -1375,15 +1450,25 @@ class AndroidEqualizerGetParametersRequest {
 /// Information communicated to the platform implementation after requesting the
 /// equalizer parameters.
 class AndroidEqualizerGetParametersResponse {
-  final AndroidEqualizerParametersMessage parameters;
+  final AndroidEqualizerParametersMessage? parameters;
+  final bool available;
+  final String? errorMessage;
 
-  AndroidEqualizerGetParametersResponse({required this.parameters});
+  AndroidEqualizerGetParametersResponse({
+    required this.parameters,
+    this.available = true,
+    this.errorMessage,
+  });
 
   static AndroidEqualizerGetParametersResponse fromMap(
           Map<dynamic, dynamic> map) =>
       AndroidEqualizerGetParametersResponse(
-        parameters: AndroidEqualizerParametersMessage.fromMap(
-            map['parameters'] as Map<dynamic, dynamic>),
+        parameters: map['parameters'] == null
+            ? null
+            : AndroidEqualizerParametersMessage.fromMap(
+                map['parameters'] as Map<dynamic, dynamic>),
+        available: map['available'] as bool? ?? map['parameters'] != null,
+        errorMessage: map['errorMessage'] as String?,
       );
 }
 
