@@ -1,0 +1,174 @@
+name: P2 Android confirmed seek hardening
+
+on:
+  push:
+    branches:
+      - automation/p2-confirmed-seek
+    paths:
+      - .github/workflows/p2-android-confirmed-seek-hardening.yml
+
+permissions:
+  contents: write
+
+jobs:
+  harden-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: automation/p2-confirmed-seek
+          fetch-depth: 0
+      - name: Verify exact source candidate
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD^)" = "c3ea3d43c84ab527668df9099b006ae22d3887c9"
+          test -z "$(git diff --name-only c3ea3d43c84ab527668df9099b006ae22d3887c9...HEAD | grep -v '^\.github/')"
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Resolve packages
+        shell: bash
+        run: |
+          (cd just_audio_platform_interface && flutter pub get --no-example)
+          (cd just_audio && flutter pub get --no-example)
+          git checkout -- just_audio_platform_interface/analysis_options.yaml just_audio/analysis_options.yaml
+      - name: Use Media3 discontinuity position as reached evidence
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          p = Path('just_audio/android/src/main/java/com/ryanheise/just_audio/AudioPlayer.java')
+          text = p.read_text()
+          old = '''        case Player.DISCONTINUITY_REASON_SEEK:
+            updateCurrentIndex();
+            if (confirmedSeekResult != null) {
+                completeConfirmedSeek("reached", null, true);
+            }
+            break;
+'''
+          new = '''        case Player.DISCONTINUITY_REASON_SEEK:
+            updateCurrentIndex();
+            if (confirmedSeekResult != null) {
+                completeConfirmedSeekReached(newPosition);
+            }
+            break;
+'''
+          if text.count(old) != 1:
+              raise SystemExit('seek discontinuity block mismatch')
+          text = text.replace(old, new, 1)
+          replacements = {
+              'completeConfirmedSeek("superseded", null, false);': 'completeConfirmedSeek("superseded", null);',
+              'completeConfirmedSeek("rejected", null, false);': 'completeConfirmedSeek("rejected", null);',
+              'completeConfirmedSeek("failed", error.getMessage(), false);': 'completeConfirmedSeek("failed", error.getMessage());',
+              'completeConfirmedSeek("failed", e.getMessage(), false);': 'completeConfirmedSeek("failed", e.getMessage());',
+          }
+          for old_call, new_call in replacements.items():
+              if old_call not in text:
+                  raise SystemExit(f'missing call: {old_call}')
+              text = text.replace(old_call, new_call)
+          old_method = '''    private void completeConfirmedSeek(
+            String status,
+            String errorMessage,
+            boolean includeActualPosition) {
+        Result result = confirmedSeekResult;
+        if (result == null) return;
+        confirmedSeekResult = null;
+        seekPos = null;
+        Map<String, Object> response = new HashMap<>();
+        response.put("status", status);
+        if (includeActualPosition && player != null) {
+            response.put("actualPosition", 1000L * player.getCurrentPosition());
+            response.put("actualIndex", player.getCurrentMediaItemIndex());
+        }
+        if (errorMessage != null) {
+            response.put("errorMessage", errorMessage);
+        }
+        result.success(response);
+    }
+'''
+          new_method = '''    private void completeConfirmedSeekReached(PositionInfo newPosition) {
+        Result result = confirmedSeekResult;
+        if (result == null) return;
+        confirmedSeekResult = null;
+        seekPos = null;
+        result.success(mapOf(
+            "status", "reached",
+            "actualPosition", 1000L * newPosition.positionMs,
+            "actualIndex", newPosition.mediaItemIndex
+        ));
+    }
+
+    private void completeConfirmedSeek(String status, String errorMessage) {
+        Result result = confirmedSeekResult;
+        if (result == null) return;
+        confirmedSeekResult = null;
+        seekPos = null;
+        Map<String, Object> response = new HashMap<>();
+        response.put("status", status);
+        if (errorMessage != null) {
+            response.put("errorMessage", errorMessage);
+        }
+        result.success(response);
+    }
+'''
+          if text.count(old_method) != 1:
+              raise SystemExit('confirmed seek completion helper mismatch')
+          p.write_text(text.replace(old_method, new_method, 1))
+          PY
+          git diff --check
+          test "$(git diff --name-only | grep -v '^\.github/' | paste -sd, -)" = "just_audio/android/src/main/java/com/ryanheise/just_audio/AudioPlayer.java"
+          grep -q 'completeConfirmedSeekReached(newPosition)' just_audio/android/src/main/java/com/ryanheise/just_audio/AudioPlayer.java
+          grep -q 'newPosition.positionMs' just_audio/android/src/main/java/com/ryanheise/just_audio/AudioPlayer.java
+          if grep -q 'completeConfirmedSeek("reached"' just_audio/android/src/main/java/com/ryanheise/just_audio/AudioPlayer.java; then exit 1; fi
+      - name: just_audio analyze and tests
+        working-directory: just_audio
+        shell: bash
+        run: |
+          flutter analyze lib test --no-fatal-warnings
+          flutter test
+      - name: Android compile host
+        shell: bash
+        run: |
+          flutter create --platforms=android --org dev.kyomorie /tmp/p2_android_hardened
+          python3 <<'PY'
+          import os
+          from pathlib import Path
+          root = Path(os.environ['GITHUB_WORKSPACE'])
+          Path('/tmp/p2_android_hardened/pubspec.yaml').write_text(f'''name: p2_android_hardened
+          publish_to: none
+          environment:
+            sdk: ">=3.1.3 <4.0.0"
+          dependencies:
+            flutter:
+              sdk: flutter
+            just_audio:
+              path: {root / 'just_audio'}
+          flutter:
+            uses-material-design: true
+          '''.replace('          ', ''))
+          Path('/tmp/p2_android_hardened/lib/main.dart').write_text('''import 'package:flutter/widgets.dart';
+          import 'package:just_audio/just_audio.dart';
+          void main() {
+            WidgetsFlutterBinding.ensureInitialized();
+            final player = AudioPlayer();
+            player.seekConfirmed(const Duration(seconds: 1));
+            runApp(const SizedBox.shrink());
+          }
+          '''.replace('          ', ''))
+          PY
+          (cd /tmp/p2_android_hardened && flutter pub get && flutter build apk --debug)
+      - name: Scope and commit
+        shell: bash
+        run: |
+          git checkout -- just_audio_platform_interface/analysis_options.yaml just_audio/analysis_options.yaml
+          git checkout -- just_audio_platform_interface/pubspec.lock just_audio/pubspec.lock 2>/dev/null || true
+          git diff --check
+          unexpected="$(git diff --name-only | grep -Ev '^(just_audio/android/src/main/java/com/ryanheise/just_audio/AudioPlayer.java)$' || true)"
+          if [[ -n "$unexpected" ]]; then echo "$unexpected"; exit 1; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add just_audio/android/src/main/java/com/ryanheise/just_audio/AudioPlayer.java
+          git commit -m "fix: bind confirmed seek to Media3 discontinuity"
+          git push origin HEAD:automation/p2-confirmed-seek
