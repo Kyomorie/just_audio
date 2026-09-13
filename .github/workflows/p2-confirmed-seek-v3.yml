@@ -42,8 +42,8 @@ jobs:
           from pathlib import Path
           path = Path('.github/scripts/apply-p2-confirmed-seek-v2.py')
           text = path.read_text()
-          old = 'completePlaybackStart(\\"rejected\\", null);'
-          new = 'completePlaybackStart(\\"rejected\\", \\"Playback completed before start acknowledgment\\");'
+          old = r'completePlaybackStart(\"rejected\", null);'
+          new = r'completePlaybackStart(\"rejected\", \"Playback completed before start acknowledgment\");'
           count = text.count(old)
           if count != 2:
               raise SystemExit(f'Expected two STATE_ENDED helper literals, found {count}')
