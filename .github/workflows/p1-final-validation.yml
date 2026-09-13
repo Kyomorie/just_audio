@@ -11,7 +11,7 @@ permissions:
   contents: read
 
 env:
-  JUST_AUDIO_SHA: 736085f3dc31d597236ff7c773ba448fb0db9c67
+  JUST_AUDIO_SHA: f80ad2ee8a73e5e32a82df20c98666385c6b2aca
   MEDIA_KIT_SHA: c1a5a15046ab565613c2d1e8736152aef9b6348c
 
 jobs:
@@ -21,7 +21,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: 736085f3dc31d597236ff7c773ba448fb0db9c67
+          ref: f80ad2ee8a73e5e32a82df20c98666385c6b2aca
       - name: Verify exact just_audio source
         shell: bash
         run: |
@@ -73,7 +73,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: 736085f3dc31d597236ff7c773ba448fb0db9c67
+          ref: f80ad2ee8a73e5e32a82df20c98666385c6b2aca
       - name: Verify exact just_audio source
         shell: bash
         run: |
@@ -125,7 +125,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: 736085f3dc31d597236ff7c773ba448fb0db9c67
+          ref: f80ad2ee8a73e5e32a82df20c98666385c6b2aca
       - uses: actions/checkout@v6
         with:
           repository: Kyomorie/just_audio_media_kit
@@ -165,6 +165,9 @@ jobs:
             just_audio_media_kit:
               path: {root / 'media_kit_adapter'}
             media_kit_libs_linux: any
+          dependency_overrides:
+            just_audio_platform_interface:
+              path: {root / 'just_audio_platform_interface'}
           flutter:
             uses-material-design: true
           '''.replace('          ', ''))
@@ -193,7 +196,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: 736085f3dc31d597236ff7c773ba448fb0db9c67
+          ref: f80ad2ee8a73e5e32a82df20c98666385c6b2aca
       - uses: actions/checkout@v6
         with:
           repository: Kyomorie/just_audio_media_kit
@@ -226,6 +229,9 @@ jobs:
             just_audio_media_kit:
               path: $root/media_kit_adapter
             media_kit_libs_windows_audio: any
+          dependency_overrides:
+            just_audio_platform_interface:
+              path: $root/just_audio_platform_interface
           flutter:
             uses-material-design: true
           "@
