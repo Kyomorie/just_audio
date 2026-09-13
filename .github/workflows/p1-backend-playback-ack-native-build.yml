@@ -36,11 +36,13 @@ jobs:
         run: |
           flutter create --platforms=android --org dev.kyomorie /tmp/p1_android_smoke
           python3 <<'PY'
+          import os
           from pathlib import Path
           path = Path('/tmp/p1_android_smoke/pubspec.yaml')
           text = path.read_text()
           needle = "dependencies:\n  flutter:\n    sdk: flutter\n"
-          replacement = needle + "  just_audio:\n    path: $GITHUB_WORKSPACE/just_audio\n"
+          package_path = Path(os.environ['GITHUB_WORKSPACE']) / 'just_audio'
+          replacement = needle + f"  just_audio:\n    path: {package_path}\n"
           if text.count(needle) != 1:
               raise SystemExit('Unexpected generated pubspec structure')
           path.write_text(text.replace(needle, replacement, 1))
@@ -77,11 +79,13 @@ jobs:
         run: |
           flutter create --platforms=macos --org dev.kyomorie /tmp/p1_macos_smoke
           python3 <<'PY'
+          import os
           from pathlib import Path
           path = Path('/tmp/p1_macos_smoke/pubspec.yaml')
           text = path.read_text()
           needle = "dependencies:\n  flutter:\n    sdk: flutter\n"
-          replacement = needle + "  just_audio:\n    path: $GITHUB_WORKSPACE/just_audio\n"
+          package_path = Path(os.environ['GITHUB_WORKSPACE']) / 'just_audio'
+          replacement = needle + f"  just_audio:\n    path: {package_path}\n"
           if text.count(needle) != 1:
               raise SystemExit('Unexpected generated pubspec structure')
           path.write_text(text.replace(needle, replacement, 1))
