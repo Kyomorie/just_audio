@@ -1707,6 +1707,22 @@ void runTests() {
     await player.dispose();
   });
 
+  test('playback start acknowledgment fails closed without native dispatch',
+      () async {
+    final player = AudioPlayer(handleAudioSessionActivation: false);
+
+    final playFuture = player.play();
+    final result = await player.waitForPlaybackStart();
+    await playFuture;
+
+    expect(result.status, PlaybackStartStatus.failed);
+    expect(result.started, isFalse);
+    expect(result.errorMessage, contains('not dispatched'));
+
+    await player.stop();
+    await player.dispose();
+  });
+
   test('playback start acknowledgment rejects without play intent', () async {
     final player = AudioPlayer();
     await player.setUrl('https://foo.foo/foo.mp3');

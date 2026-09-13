@@ -214,7 +214,7 @@ class AudioPlayer {
   final bool _androidApplyAudioAttributes;
   final bool _handleAudioSessionActivation;
   int _playRequestGeneration = 0;
-  Completer<void>? _playRequestDispatchCompleter;
+  Completer<bool>? _playRequestDispatchCompleter;
 
   /// Counts how many times [_setPlatformActive] is called.
   int _activationCount = 0;
@@ -1119,12 +1119,12 @@ class AudioPlayer {
   ///
   /// This method activates the audio session before playback, and will do
   /// nothing if activation of the audio session fails for any reason.
-  void _completePlayRequestDispatch(Completer<void>? completer) {
+  void _completePlayRequestDispatch(
+    Completer<bool>? completer, {
+    required bool dispatched,
+  }) {
     if (completer != null && !completer.isCompleted) {
-      completer.complete();
-    }
-    if (identical(_playRequestDispatchCompleter, completer)) {
-      _playRequestDispatchCompleter = null;
+      completer.complete(dispatched);
     }
   }
 
@@ -1132,7 +1132,7 @@ class AudioPlayer {
     if (_disposed) return;
     if (playing) return;
     _playInterrupted = false;
-    final playRequestDispatchCompleter = Completer<void>();
+    final playRequestDispatchCompleter = Completer<bool>();
     _playRequestGeneration++;
     _playRequestDispatchCompleter = playRequestDispatchCompleter;
     // Broadcast to clients immediately, but revert to false if we fail to
@@ -1151,7 +1151,11 @@ class AudioPlayer {
       if (!_handleAudioSessionActivation ||
           await audioSession.setActive(true)) {
         if (!playing) {
-          _completePlayRequestDispatch(playRequestDispatchCompleter);
+          _completePlayRequestDispatch(
+            playRequestDispatchCompleter,
+            dispatched: false,
+          );
+          if (!playCompleter.isCompleted) playCompleter.complete();
           return;
         }
         // TODO: rewrite this to more cleanly handle simultaneous load/play
@@ -1177,23 +1181,55 @@ class AudioPlayer {
               playRequestDispatchCompleter: playRequestDispatchCompleter,
             );
             if (activation != null) {
-              unawaited(activation.whenComplete(() {
-                _completePlayRequestDispatch(playRequestDispatchCompleter);
-              }).catchError((dynamic e) async => null));
+              unawaited(activation.then<void>(
+                (_) {
+                  if (!playRequestDispatchCompleter.isCompleted) {
+                    _completePlayRequestDispatch(
+                      playRequestDispatchCompleter,
+                      dispatched: false,
+                    );
+                    if (!playCompleter.isCompleted) playCompleter.complete();
+                  }
+                },
+                onError: (Object error, StackTrace stackTrace) {
+                  _completePlayRequestDispatch(
+                    playRequestDispatchCompleter,
+                    dispatched: false,
+                  );
+                  if (!playCompleter.isCompleted) {
+                    playCompleter.completeError(error, stackTrace);
+                  }
+                },
+              ));
             } else {
-              _completePlayRequestDispatch(playRequestDispatchCompleter);
+              _completePlayRequestDispatch(
+                playRequestDispatchCompleter,
+                dispatched: false,
+              );
+              if (!playCompleter.isCompleted) playCompleter.complete();
             }
           }
         } else {
-          _completePlayRequestDispatch(playRequestDispatchCompleter);
+          _completePlayRequestDispatch(
+            playRequestDispatchCompleter,
+            dispatched: false,
+          );
+          if (!playCompleter.isCompleted) playCompleter.complete();
         }
       } else {
         // Revert if we fail to activate the audio session.
         _playerEventSubject.add(playerEvent.copyWith(playing: false));
-        _completePlayRequestDispatch(playRequestDispatchCompleter);
+        _completePlayRequestDispatch(
+          playRequestDispatchCompleter,
+          dispatched: false,
+        );
+        if (!playCompleter.isCompleted) playCompleter.complete();
       }
     } catch (_) {
-      _completePlayRequestDispatch(playRequestDispatchCompleter);
+      _completePlayRequestDispatch(
+        playRequestDispatchCompleter,
+        dispatched: false,
+      );
       rethrow;
     }
     await playCompleter.future;
@@ -1205,7 +1241,10 @@ class AudioPlayer {
     if (_disposed) return;
     if (!playing) return;
     _playRequestGeneration++;
-    _completePlayRequestDispatch(_playRequestDispatchCompleter);
+    _completePlayRequestDispatch(
+      _playRequestDispatchCompleter,
+      dispatched: false,
+    );
     final stopwatch = Stopwatch();
     stopwatch.start();
     _playInterrupted = false;
@@ -1240,10 +1279,9 @@ class AudioPlayer {
 
     final playRequestGeneration = _playRequestGeneration;
     final playRequestDispatchCompleter = _playRequestDispatchCompleter;
-    if (playRequestDispatchCompleter != null &&
-        !playRequestDispatchCompleter.isCompleted) {
-      await playRequestDispatchCompleter.future;
-    }
+    final playRequestDispatched = playRequestDispatchCompleter == null
+        ? null
+        : await playRequestDispatchCompleter.future;
     if (_disposed) {
       return const PlaybackStartResult(
         PlaybackStartStatus.failed,
@@ -1252,6 +1290,12 @@ class AudioPlayer {
     }
     if (_playRequestGeneration != playRequestGeneration || !playing) {
       return const PlaybackStartResult(PlaybackStartStatus.superseded);
+    }
+    if (playRequestDispatched == false) {
+      return const PlaybackStartResult(
+        PlaybackStartStatus.failed,
+        errorMessage: 'Native play request was not dispatched',
+      );
     }
 
     try {
@@ -1296,15 +1340,22 @@ class AudioPlayer {
   Future<void> _sendPlayRequest(
     AudioPlayerPlatform platform,
     Completer<void>? playCompleter, {
-    Completer<void>? playRequestDispatchCompleter,
+    Completer<bool>? playRequestDispatchCompleter,
   }) async {
     try {
       if (!playing) {
-        _completePlayRequestDispatch(playRequestDispatchCompleter);
+        _completePlayRequestDispatch(
+          playRequestDispatchCompleter,
+          dispatched: false,
+        );
         return;
       }
-      _completePlayRequestDispatch(playRequestDispatchCompleter);
-      await platform.play(PlayRequest());
+      final playFuture = platform.play(PlayRequest());
+      _completePlayRequestDispatch(
+        playRequestDispatchCompleter,
+        dispatched: true,
+      );
+      await playFuture;
       playCompleter?.complete();
     } catch (e, stackTrace) {
       playCompleter?.completeError(e, stackTrace);
@@ -1322,7 +1373,10 @@ class AudioPlayer {
   Future<void> stop() async {
     if (_disposed) return;
     _playRequestGeneration++;
-    _completePlayRequestDispatch(_playRequestDispatchCompleter);
+    _completePlayRequestDispatch(
+      _playRequestDispatchCompleter,
+      dispatched: false,
+    );
     final future =
         _setPlatformActive(false)?.catchError((dynamic e) async => null);
 
@@ -1632,7 +1686,7 @@ class AudioPlayer {
   Future<Duration?>? _setPlatformActive(
     bool active, {
     Completer<void>? playCompleter,
-    Completer<void>? playRequestDispatchCompleter,
+    Completer<bool>? playRequestDispatchCompleter,
     bool force = false,
   }) {
     if (_disposed) return null;
