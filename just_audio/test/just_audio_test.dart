@@ -1689,11 +1689,60 @@ void runTests() {
     }
   });
 
+  test('backend playback start acknowledgment', () async {
+    final player = AudioPlayer();
+    await player.setUrl('https://foo.foo/foo.mp3');
+    final platform = mock.mostRecentPlayer!;
+
+    unawaited(player.play());
+    final result = await player.waitForPlaybackStart();
+
+    expect(result.status, PlaybackStartStatus.started);
+    expect(result.started, isTrue);
+    expect(platform.awaitPlaybackStartCallCount, 1);
+    expect(platform.lastPlaybackStartAttemptId, isNotEmpty);
+
+    await player.pause();
+    await player.dispose();
+  });
+
+  test('playback start acknowledgment rejects without play intent', () async {
+    final player = AudioPlayer();
+    await player.setUrl('https://foo.foo/foo.mp3');
+    final platform = mock.mostRecentPlayer!;
+
+    final result = await player.waitForPlaybackStart();
+
+    expect(result.status, PlaybackStartStatus.rejected);
+    expect(result.started, isFalse);
+    expect(platform.awaitPlaybackStartCallCount, 0);
+
+    await player.dispose();
+  });
+
+  test('playback start acknowledgment propagates superseded', () async {
+    final player = AudioPlayer();
+    await player.setUrl('https://foo.foo/foo.mp3');
+    final platform = mock.mostRecentPlayer!
+      ..playbackStartStatus = PlaybackStartStatusMessage.superseded;
+
+    unawaited(player.play());
+    final result = await player.waitForPlaybackStart();
+
+    expect(result.status, PlaybackStartStatus.superseded);
+    expect(result.started, isFalse);
+    expect(platform.awaitPlaybackStartCallCount, 1);
+
+    await player.pause();
+    await player.dispose();
+  });
+
   test('asyncMessages', () async {
     final player = AudioPlayer();
     await player.setUrl('https://foo.foo/foo.mp3');
     final platform = mock.mostRecentPlayer!;
     expect(player.playing, equals(false));
+    expect(player.effectivePlaying, equals(false));
     expect(player.volume, equals(1.0));
     expect(player.speed, equals(1.0));
     expect(player.pitch, equals(1.0));
@@ -1701,6 +1750,7 @@ void runTests() {
     expect(player.shuffleModeEnabled, equals(false));
     platform._broadcastDataMessage(PlayerDataMessage(
       playing: true,
+      effectivePlaying: true,
       volume: 0.7,
       speed: 0.8,
       pitch: 0.9,
@@ -1709,6 +1759,7 @@ void runTests() {
     ));
     await Future<void>.delayed(Duration.zero);
     expect(player.playing, equals(true));
+    expect(player.effectivePlaying, equals(true));
     expect(player.volume, equals(0.7));
     expect(player.speed, equals(0.8));
     expect(player.pitch, equals(0.9));
@@ -1808,6 +1859,11 @@ class MockAudioPlayer extends AudioPlayerPlatform {
   int? _errorCode;
   String? _errorMessage;
   Completer<void>? _loadBlock;
+  PlaybackStartStatusMessage playbackStartStatus =
+      PlaybackStartStatusMessage.started;
+  String? playbackStartErrorMessage;
+  int awaitPlaybackStartCallCount = 0;
+  String? lastPlaybackStartAttemptId;
 
   MockAudioPlayer(InitRequest request)
       : audioLoadConfiguration = request.audioLoadConfiguration,
@@ -1921,6 +1977,17 @@ class MockAudioPlayer extends AudioPlayerPlatform {
       _broadcastPlaybackEvent();
       _playCompleter?.complete();
     });
+  }
+
+  @override
+  Future<AwaitPlaybackStartResponse> awaitPlaybackStart(
+      AwaitPlaybackStartRequest request) async {
+    awaitPlaybackStartCallCount++;
+    lastPlaybackStartAttemptId = request.attemptId;
+    return AwaitPlaybackStartResponse(
+      status: playbackStartStatus,
+      errorMessage: playbackStartErrorMessage,
+    );
   }
 
   @override
