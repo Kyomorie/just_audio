@@ -1,0 +1,443 @@
+name: P1 core fail-closed final
+
+on:
+  push:
+    branches:
+      - automation/p1-just-audio-apply
+    paths:
+      - .github/workflows/p1-core-failclosed-final.yml
+
+permissions: {}
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: feat/backend-playback-ack
+          fetch-depth: 2
+
+      - name: Verify exact target head
+        shell: bash
+        run: |
+          expected='c6efa2e1415155a6aad515c7f255602b785883c2'
+          actual="$(git rev-parse HEAD)"
+          [[ "$actual" == "$expected" ]] || { echo "Unexpected target head: $actual" >&2; exit 1; }
+
+      - name: Apply final fail-closed dispatch semantics
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          source = Path('just_audio/lib/just_audio.dart')
+          text = source.read_text()
+
+          field = '  Completer<void>? _playRequestDispatchCompleter;\n'
+          assert text.count(field) == 1, 'unexpected dispatch field'
+          text = text.replace(field, '  Completer<bool>? _playRequestDispatchCompleter;\n', 1)
+
+          old_helper = """  void _completePlayRequestDispatch(Completer<void>? completer) {
+            if (completer != null && !completer.isCompleted) {
+              completer.complete();
+            }
+            if (identical(_playRequestDispatchCompleter, completer)) {
+              _playRequestDispatchCompleter = null;
+            }
+          }
+          """
+          new_helper = """  void _completePlayRequestDispatch(
+            Completer<bool>? completer, {
+            required bool dispatched,
+          }) {
+            if (completer != null && !completer.isCompleted) {
+              completer.complete(dispatched);
+            }
+          }
+          """
+          assert text.count(old_helper) == 1, 'unexpected dispatch helper'
+          text = text.replace(old_helper, new_helper, 1)
+
+          old_play = """  Future<void> play() async {
+            if (_disposed) return;
+            if (playing) return;
+            _playInterrupted = false;
+            final playRequestDispatchCompleter = Completer<void>();
+            _playRequestGeneration++;
+            _playRequestDispatchCompleter = playRequestDispatchCompleter;
+            // Broadcast to clients immediately, but revert to false if we fail to
+            // activate the audio session. This allows setAudioSource to be aware of a
+            // prior play request.
+            _playerEventSubject.add(PlayerEvent(
+              playing: true,
+              playbackEvent: playbackEvent.copyWith(
+                updatePosition: position,
+                updateTime: DateTime.now(),
+              ),
+            ));
+            final playCompleter = Completer<dynamic>();
+            try {
+              final audioSession = await AudioSession.instance;
+              if (!_handleAudioSessionActivation ||
+                  await audioSession.setActive(true)) {
+                if (!playing) {
+                  _completePlayRequestDispatch(playRequestDispatchCompleter);
+                  return;
+                }
+                // TODO: rewrite this to more cleanly handle simultaneous load/play
+                // requests which each may result in platform play requests.
+                final requireActive = _playlist.children.isNotEmpty;
+                if (requireActive) {
+                  if (_active) {
+                    // If the native platform is already active, send it a play request.
+                    // NOTE: If a load() request happens simultaneously, this may result
+                    // in two play requests being sent. The platform implementation should
+                    // ignore the second play request since it is already playing.
+                    _sendPlayRequest(
+                      await _platform,
+                      playCompleter,
+                      playRequestDispatchCompleter: playRequestDispatchCompleter,
+                    );
+                  } else {
+                    // If the native platform wasn't already active, activating it will
+                    // implicitly restore the playing state and send a play request.
+                    final activation = _setPlatformActive(
+                      true,
+                      playCompleter: playCompleter,
+                      playRequestDispatchCompleter: playRequestDispatchCompleter,
+                    );
+                    if (activation != null) {
+                      unawaited(activation.whenComplete(() {
+                        _completePlayRequestDispatch(playRequestDispatchCompleter);
+                      }).catchError((dynamic e) async => null));
+                    } else {
+                      _completePlayRequestDispatch(playRequestDispatchCompleter);
+                    }
+                  }
+                } else {
+                  _completePlayRequestDispatch(playRequestDispatchCompleter);
+                }
+              } else {
+                // Revert if we fail to activate the audio session.
+                _playerEventSubject.add(playerEvent.copyWith(playing: false));
+                _completePlayRequestDispatch(playRequestDispatchCompleter);
+              }
+            } catch (_) {
+              _completePlayRequestDispatch(playRequestDispatchCompleter);
+              rethrow;
+            }
+            await playCompleter.future;
+          }
+          """
+          new_play = """  Future<void> play() async {
+            if (_disposed) return;
+            if (playing) return;
+            _playInterrupted = false;
+            final playRequestDispatchCompleter = Completer<bool>();
+            _playRequestGeneration++;
+            _playRequestDispatchCompleter = playRequestDispatchCompleter;
+            // Broadcast to clients immediately, but revert to false if we fail to
+            // activate the audio session. This allows setAudioSource to be aware of a
+            // prior play request.
+            _playerEventSubject.add(PlayerEvent(
+              playing: true,
+              playbackEvent: playbackEvent.copyWith(
+                updatePosition: position,
+                updateTime: DateTime.now(),
+              ),
+            ));
+            final playCompleter = Completer<dynamic>();
+            try {
+              final audioSession = await AudioSession.instance;
+              if (!_handleAudioSessionActivation ||
+                  await audioSession.setActive(true)) {
+                if (!playing) {
+                  _completePlayRequestDispatch(
+                    playRequestDispatchCompleter,
+                    dispatched: false,
+                  );
+                  if (!playCompleter.isCompleted) playCompleter.complete();
+                  return;
+                }
+                // TODO: rewrite this to more cleanly handle simultaneous load/play
+                // requests which each may result in platform play requests.
+                final requireActive = _playlist.children.isNotEmpty;
+                if (requireActive) {
+                  if (_active) {
+                    // If the native platform is already active, send it a play request.
+                    // NOTE: If a load() request happens simultaneously, this may result
+                    // in two play requests being sent. The platform implementation should
+                    // ignore the second play request since it is already playing.
+                    _sendPlayRequest(
+                      await _platform,
+                      playCompleter,
+                      playRequestDispatchCompleter: playRequestDispatchCompleter,
+                    );
+                  } else {
+                    // If the native platform wasn't already active, activating it will
+                    // implicitly restore the playing state and send a play request.
+                    final activation = _setPlatformActive(
+                      true,
+                      playCompleter: playCompleter,
+                      playRequestDispatchCompleter: playRequestDispatchCompleter,
+                    );
+                    if (activation != null) {
+                      unawaited(activation.then<void>(
+                        (_) {
+                          if (!playRequestDispatchCompleter.isCompleted) {
+                            _completePlayRequestDispatch(
+                              playRequestDispatchCompleter,
+                              dispatched: false,
+                            );
+                            if (!playCompleter.isCompleted) playCompleter.complete();
+                          }
+                        },
+                        onError: (Object error, StackTrace stackTrace) {
+                          _completePlayRequestDispatch(
+                            playRequestDispatchCompleter,
+                            dispatched: false,
+                          );
+                          if (!playCompleter.isCompleted) {
+                            playCompleter.completeError(error, stackTrace);
+                          }
+                        },
+                      ));
+                    } else {
+                      _completePlayRequestDispatch(
+                        playRequestDispatchCompleter,
+                        dispatched: false,
+                      );
+                      if (!playCompleter.isCompleted) playCompleter.complete();
+                    }
+                  }
+                } else {
+                  _completePlayRequestDispatch(
+                    playRequestDispatchCompleter,
+                    dispatched: false,
+                  );
+                  if (!playCompleter.isCompleted) playCompleter.complete();
+                }
+              } else {
+                // Revert if we fail to activate the audio session.
+                _playerEventSubject.add(playerEvent.copyWith(playing: false));
+                _completePlayRequestDispatch(
+                  playRequestDispatchCompleter,
+                  dispatched: false,
+                );
+                if (!playCompleter.isCompleted) playCompleter.complete();
+              }
+            } catch (_) {
+              _completePlayRequestDispatch(
+                playRequestDispatchCompleter,
+                dispatched: false,
+              );
+              rethrow;
+            }
+            await playCompleter.future;
+          }
+          """
+          assert text.count(old_play) == 1, 'unexpected play implementation'
+          text = text.replace(old_play, new_play, 1)
+
+          old_pause = """    _playRequestGeneration++;
+            _completePlayRequestDispatch(_playRequestDispatchCompleter);
+          """
+          new_pause = """    _playRequestGeneration++;
+            _completePlayRequestDispatch(
+              _playRequestDispatchCompleter,
+              dispatched: false,
+            );
+          """
+          assert text.count(old_pause) == 2, 'unexpected pause/stop settlements'
+          text = text.replace(old_pause, new_pause, 2)
+
+          old_wait = """    final playRequestGeneration = _playRequestGeneration;
+            final playRequestDispatchCompleter = _playRequestDispatchCompleter;
+            if (playRequestDispatchCompleter != null &&
+                !playRequestDispatchCompleter.isCompleted) {
+              await playRequestDispatchCompleter.future;
+            }
+            if (_disposed) {
+          """
+          new_wait = """    final playRequestGeneration = _playRequestGeneration;
+            final playRequestDispatchCompleter = _playRequestDispatchCompleter;
+            final playRequestDispatched = playRequestDispatchCompleter == null
+                ? null
+                : await playRequestDispatchCompleter.future;
+            if (_disposed) {
+          """
+          assert text.count(old_wait) == 1, 'unexpected wait barrier'
+          text = text.replace(old_wait, new_wait, 1)
+
+          wait_anchor = """    if (_playRequestGeneration != playRequestGeneration || !playing) {
+              return const PlaybackStartResult(PlaybackStartStatus.superseded);
+            }
+
+            try {
+          """
+          wait_new = """    if (_playRequestGeneration != playRequestGeneration || !playing) {
+              return const PlaybackStartResult(PlaybackStartStatus.superseded);
+            }
+            if (playRequestDispatched == false) {
+              return const PlaybackStartResult(
+                PlaybackStartStatus.failed,
+                errorMessage: 'Native play request was not dispatched',
+              );
+            }
+
+            try {
+          """
+          assert text.count(wait_anchor) == 1, 'unexpected wait currentness guard'
+          text = text.replace(wait_anchor, wait_new, 1)
+
+          old_send = """  Future<void> _sendPlayRequest(
+            AudioPlayerPlatform platform,
+            Completer<void>? playCompleter, {
+            Completer<void>? playRequestDispatchCompleter,
+          }) async {
+            try {
+              if (!playing) {
+                _completePlayRequestDispatch(playRequestDispatchCompleter);
+                return;
+              }
+              _completePlayRequestDispatch(playRequestDispatchCompleter);
+              await platform.play(PlayRequest());
+              playCompleter?.complete();
+            } catch (e, stackTrace) {
+              playCompleter?.completeError(e, stackTrace);
+            }
+          }
+          """
+          new_send = """  Future<void> _sendPlayRequest(
+            AudioPlayerPlatform platform,
+            Completer<void>? playCompleter, {
+            Completer<bool>? playRequestDispatchCompleter,
+          }) async {
+            try {
+              if (!playing) {
+                _completePlayRequestDispatch(
+                  playRequestDispatchCompleter,
+                  dispatched: false,
+                );
+                return;
+              }
+              final playFuture = platform.play(PlayRequest());
+              _completePlayRequestDispatch(
+                playRequestDispatchCompleter,
+                dispatched: true,
+              );
+              await playFuture;
+              playCompleter?.complete();
+            } catch (e, stackTrace) {
+              playCompleter?.completeError(e, stackTrace);
+            }
+          }
+          """
+          assert text.count(old_send) == 1, 'unexpected sendPlayRequest implementation'
+          text = text.replace(old_send, new_send, 1)
+
+          old_sig = """    Completer<void>? playCompleter,
+            Completer<void>? playRequestDispatchCompleter,
+            bool force = false,
+          """
+          new_sig = """    Completer<void>? playCompleter,
+            Completer<bool>? playRequestDispatchCompleter,
+            bool force = false,
+          """
+          assert text.count(old_sig) == 1, 'unexpected setPlatformActive signature'
+          text = text.replace(old_sig, new_sig, 1)
+          source.write_text(text)
+
+          test = Path('just_audio/test/just_audio_test.dart')
+          t = test.read_text()
+          anchor = """  test('playback start acknowledgment rejects without play intent', () async {
+          """
+          new_test = """  test('playback start acknowledgment fails closed without native dispatch',
+              () async {
+            final player = AudioPlayer(handleAudioSessionActivation: false);
+
+            final playFuture = player.play();
+            final result = await player.waitForPlaybackStart();
+            await playFuture;
+
+            expect(result.status, PlaybackStartStatus.failed);
+            expect(result.started, isFalse);
+            expect(result.errorMessage, contains('not dispatched'));
+
+            await player.stop();
+            await player.dispose();
+          });
+
+          test('playback start acknowledgment rejects without play intent', () async {
+          """
+          assert t.count(anchor) == 1, 'unexpected playback ack test anchor'
+          test.write_text(t.replace(anchor, new_test, 1))
+          PY
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Resolve language version
+        working-directory: just_audio
+        shell: bash
+        run: |
+          flutter pub get --no-example
+          git checkout -- analysis_options.yaml
+
+      - name: Format and exact scope gate
+        shell: bash
+        run: |
+          dart format just_audio/lib/just_audio.dart just_audio/test/just_audio_test.dart
+          git diff --check
+          actual="$(git diff --name-only | sort)"
+          expected="$(printf '%s\n' just_audio/lib/just_audio.dart just_audio/test/just_audio_test.dart | sort)"
+          [[ "$actual" == "$expected" ]] || { printf 'Unexpected changed paths:\n%s\n' "$actual" >&2; exit 1; }
+
+      - name: Analyze and run full just_audio tests
+        working-directory: just_audio
+        shell: bash
+        run: |
+          flutter analyze lib --no-fatal-warnings 2>&1 | tee /tmp/analyze.txt
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+          issues = [line for line in Path('/tmp/analyze.txt').read_text().splitlines() if re.match(r'^\s*(error|warning|info) •', line)]
+          if len(issues) != 1 or 'warning •' not in issues[0] or 'unawaited_return_in_try_block' not in issues[0]:
+              raise SystemExit(f'Unexpected analyzer issues: {issues}')
+          PY
+          flutter test test/just_audio_test.dart
+
+      - name: Restore validation side effects
+        shell: bash
+        run: |
+          git checkout -- just_audio/analysis_options.yaml
+          rm -rf just_audio/.dart_tool
+          rm -f just_audio/pubspec.lock
+          git diff --check
+          actual="$(git diff --name-only | sort)"
+          expected="$(printf '%s\n' just_audio/lib/just_audio.dart just_audio/test/just_audio_test.dart | sort)"
+          [[ "$actual" == "$expected" ]] || { printf 'Unexpected changed paths after validation:\n%s\n' "$actual" >&2; exit 1; }
+
+      - name: Commit validated core hardening
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add just_audio/lib/just_audio.dart just_audio/test/just_audio_test.dart
+          git commit -m 'fix: fail closed before native play dispatch'
+
+      - name: Push only if target is unchanged
+        shell: bash
+        run: |
+          expected='c6efa2e1415155a6aad515c7f255602b785883c2'
+          remote_head="$(git ls-remote origin refs/heads/feat/backend-playback-ack | cut -f1)"
+          [[ "$remote_head" == "$expected" ]] || { echo "Target moved externally: $remote_head" >&2; exit 1; }
+          [[ "$(git rev-parse HEAD^)" == "$expected" ]] || { echo 'Unexpected parent' >&2; exit 1; }
+          [[ -z "$(git status --porcelain)" ]] || { git status --short >&2; exit 1; }
+          git push origin HEAD:refs/heads/feat/backend-playback-ack
