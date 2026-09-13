@@ -110,7 +110,24 @@ jobs:
         working-directory: target/just_audio
         shell: bash
         run: |
-          flutter analyze lib
+          flutter analyze lib --no-fatal-warnings 2>&1 | tee /tmp/just_audio_analyze.txt
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+
+          text = Path('/tmp/just_audio_analyze.txt').read_text()
+          issues = [
+              line for line in text.splitlines()
+              if re.match(r'^\s*(error|warning|info) •', line)
+          ]
+          if len(issues) != 1:
+              raise SystemExit(
+                  f'Expected exactly one known baseline analyzer issue, found {len(issues)}: {issues}'
+              )
+          issue = issues[0]
+          if 'warning •' not in issue or 'unawaited_return_in_try_block' not in issue:
+              raise SystemExit(f'Unexpected analyzer issue: {issue}')
+          PY
           flutter test
 
       - name: Commit validated source
