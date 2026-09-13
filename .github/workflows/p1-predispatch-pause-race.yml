@@ -1,0 +1,239 @@
+name: P1 pre-dispatch pause race
+
+on:
+  push:
+    branches:
+      - automation/p1-just-audio-apply
+    paths:
+      - .github/workflows/p1-predispatch-pause-race.yml
+
+permissions: {}
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: feat/backend-playback-ack
+          fetch-depth: 2
+
+      - name: Verify exact target head
+        shell: bash
+        run: |
+          expected='736085f3dc31d597236ff7c773ba448fb0db9c67'
+          actual="$(git rev-parse HEAD)"
+          [[ "$actual" == "$expected" ]] || { echo "Unexpected target head: $actual" >&2; exit 1; }
+
+      - name: Apply pre-dispatch pause race fix and regression test
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          source = Path('just_audio/lib/just_audio.dart')
+          text = source.read_text()
+          old = '''      if (!playing) {
+                _completePlayRequestDispatch(
+                  playRequestDispatchCompleter,
+                  dispatched: false,
+                );
+                return;
+              }
+              final playFuture = platform.play(PlayRequest());
+              _completePlayRequestDispatch(
+                playRequestDispatchCompleter,
+                dispatched: true,
+              );
+              await playFuture;
+              playCompleter?.complete();
+            } catch (e, stackTrace) {
+              playCompleter?.completeError(e, stackTrace);
+            }
+          }
+          '''
+          new = '''      if (!playing) {
+                _completePlayRequestDispatch(
+                  playRequestDispatchCompleter,
+                  dispatched: false,
+                );
+                if (playCompleter != null && !playCompleter.isCompleted) {
+                  playCompleter.complete();
+                }
+                return;
+              }
+              final playFuture = platform.play(PlayRequest());
+              _completePlayRequestDispatch(
+                playRequestDispatchCompleter,
+                dispatched: true,
+              );
+              await playFuture;
+              if (playCompleter != null && !playCompleter.isCompleted) {
+                playCompleter.complete();
+              }
+            } catch (e, stackTrace) {
+              if (playRequestDispatchCompleter != null &&
+                  !playRequestDispatchCompleter.isCompleted) {
+                _completePlayRequestDispatch(
+                  playRequestDispatchCompleter,
+                  dispatched: false,
+                );
+              }
+              if (playCompleter != null && !playCompleter.isCompleted) {
+                playCompleter.completeError(e, stackTrace);
+              }
+            }
+          }
+          '''
+          if text.count(old) != 1:
+              raise SystemExit('Unexpected _sendPlayRequest body')
+          source.write_text(text.replace(old, new, 1))
+
+          test = Path('just_audio/test/just_audio_test.dart')
+          t = test.read_text()
+
+          mock_fields = '''  MockAudioPlayer? mostRecentPlayer;
+            final _players = <String, MockAudioPlayer>{};
+          '''
+          mock_fields_new = '''  MockAudioPlayer? mostRecentPlayer;
+            final _players = <String, MockAudioPlayer>{};
+            void Function()? onPlayerSetVolume;
+          '''
+          if t.count(mock_fields) != 1:
+              raise SystemExit('Unexpected MockJustAudio fields')
+          t = t.replace(mock_fields, mock_fields_new, 1)
+
+          init_old = '''    final player = MockAudioPlayer(request);
+              _players[request.id] = player;
+          '''
+          init_new = '''    final player = MockAudioPlayer(request)
+                ..onSetVolume = onPlayerSetVolume;
+              _players[request.id] = player;
+          '''
+          if t.count(init_old) != 1:
+              raise SystemExit('Unexpected MockJustAudio init')
+          t = t.replace(init_old, init_new, 1)
+
+          player_field = '''  int playCallCount = 0;
+          '''
+          player_field_new = '''  int playCallCount = 0;
+            void Function()? onSetVolume;
+          '''
+          if t.count(player_field) != 1:
+              raise SystemExit('Unexpected MockAudioPlayer fields')
+          t = t.replace(player_field, player_field_new, 1)
+
+          set_volume_old = '''  Future<SetVolumeResponse> setVolume(SetVolumeRequest request) async {
+              return SetVolumeResponse();
+            }
+          '''
+          set_volume_new = '''  Future<SetVolumeResponse> setVolume(SetVolumeRequest request) async {
+              onSetVolume?.call();
+              return SetVolumeResponse();
+            }
+          '''
+          if t.count(set_volume_old) != 1:
+              raise SystemExit('Unexpected setVolume mock')
+          t = t.replace(set_volume_old, set_volume_new, 1)
+
+          anchor = "  test('playback start acknowledgment fails closed without native dispatch',\n"
+          if t.count(anchor) != 1:
+              raise SystemExit('Unexpected playback ack test anchor')
+          regression = '''  test('play completes when paused before native play dispatch', () async {
+              final player = AudioPlayer(handleAudioSessionActivation: false);
+              await player.setUrl('https://foo.foo/foo.mp3', preload: false);
+              final pauseCompleted = Completer<void>();
+              var pauseTriggered = false;
+              mock.onPlayerSetVolume = () {
+                if (pauseTriggered) return;
+                pauseTriggered = true;
+                unawaited(player.pause().whenComplete(() {
+                  if (!pauseCompleted.isCompleted) pauseCompleted.complete();
+                }));
+              };
+
+              final playFuture = player.play();
+              await playFuture.timeout(const Duration(seconds: 2));
+              await pauseCompleted.future.timeout(const Duration(seconds: 2));
+              final platform = mock.mostRecentPlayer!;
+
+              expect(pauseTriggered, isTrue);
+              expect(player.playing, isFalse);
+              expect(platform.playCallCount, 0);
+
+              mock.onPlayerSetVolume = null;
+              await player.dispose();
+            });
+
+          '''
+          t = t.replace(anchor, regression + anchor, 1)
+          test.write_text(t)
+          PY
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Resolve language version
+        working-directory: just_audio
+        shell: bash
+        run: |
+          flutter pub get --no-example
+          git checkout -- analysis_options.yaml
+
+      - name: Format and exact scope gate
+        shell: bash
+        run: |
+          dart format just_audio/lib/just_audio.dart just_audio/test/just_audio_test.dart
+          git diff --check
+          actual="$(git diff --name-only | sort)"
+          expected="$(printf '%s\n' just_audio/lib/just_audio.dart just_audio/test/just_audio_test.dart | sort)"
+          [[ "$actual" == "$expected" ]] || { printf 'Unexpected changed paths:\n%s\n' "$actual" >&2; exit 1; }
+
+      - name: Analyze and run full just_audio tests
+        working-directory: just_audio
+        shell: bash
+        run: |
+          flutter analyze lib --no-fatal-warnings 2>&1 | tee /tmp/analyze.txt
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+          issues = [line for line in Path('/tmp/analyze.txt').read_text().splitlines() if re.match(r'^\s*(error|warning|info) •', line)]
+          if len(issues) != 1 or 'warning •' not in issues[0] or 'unawaited_return_in_try_block' not in issues[0]:
+              raise SystemExit(f'Unexpected analyzer issues: {issues}')
+          PY
+          flutter test test/just_audio_test.dart
+
+      - name: Restore validation side effects and revalidate scope
+        shell: bash
+        run: |
+          git checkout -- just_audio/analysis_options.yaml
+          rm -rf just_audio/.dart_tool
+          rm -f just_audio/pubspec.lock
+          git diff --check
+          actual="$(git diff --name-only | sort)"
+          expected="$(printf '%s\n' just_audio/lib/just_audio.dart just_audio/test/just_audio_test.dart | sort)"
+          [[ "$actual" == "$expected" ]] || { printf 'Unexpected changed paths after validation:\n%s\n' "$actual" >&2; exit 1; }
+
+      - name: Commit validated race fix
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add just_audio/lib/just_audio.dart just_audio/test/just_audio_test.dart
+          git commit -m 'fix: settle play when superseded before native dispatch'
+          [[ "$(git rev-parse HEAD^)" == '736085f3dc31d597236ff7c773ba448fb0db9c67' ]] || { echo 'Unexpected parent' >&2; exit 1; }
+
+      - name: Push only if target is unchanged
+        shell: bash
+        run: |
+          expected='736085f3dc31d597236ff7c773ba448fb0db9c67'
+          remote_head="$(git ls-remote origin refs/heads/feat/backend-playback-ack | cut -f1)"
+          [[ "$remote_head" == "$expected" ]] || { echo "Target moved externally: $remote_head" >&2; exit 1; }
+          [[ "$(git rev-parse HEAD^)" == "$expected" ]] || { echo 'Unexpected parent' >&2; exit 1; }
+          [[ -z "$(git status --porcelain)" ]] || { git status --short >&2; exit 1; }
+          git push origin HEAD:refs/heads/feat/backend-playback-ack
