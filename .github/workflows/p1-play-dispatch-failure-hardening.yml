@@ -51,7 +51,6 @@ jobs:
               1,
           )
 
-          # Every pre-dispatch settlement is explicitly false.
           text = text.replace(
               '_completePlayRequestDispatch(playRequestDispatchCompleter);\n          return;',
               '_completePlayRequestDispatch(\n            playRequestDispatchCompleter,\n            dispatched: false,\n          );\n          return;',
@@ -64,7 +63,6 @@ jobs:
               raise SystemExit('Unexpected activation fallback')
           text = text.replace(old_activation, new_activation, 1)
 
-          # Remaining play() settlements before dispatch are false.
           play_start = text.index('  Future<void> play() async {')
           play_end = text.index('\n  /// Pauses the currently playing media.', play_start)
           play_body = text[play_start:play_end]
@@ -74,7 +72,6 @@ jobs:
           )
           text = text[:play_start] + play_body + text[play_end:]
 
-          # pause/stop supersede any not-yet-dispatched attempt.
           text = text.replace(
               '_completePlayRequestDispatch(_playRequestDispatchCompleter);',
               '_completePlayRequestDispatch(\n      _playRequestDispatchCompleter,\n      dispatched: false,\n    );',
@@ -117,8 +114,21 @@ jobs:
 
           test = Path('just_audio/test/just_audio_test.dart')
           t = test.read_text()
+
+          mock_fields = """  MockAudioPlayer? mostRecentPlayer;\n  final _players = <String, MockAudioPlayer>{};\n"""
+          mock_fields_new = """  MockAudioPlayer? mostRecentPlayer;\n  final _players = <String, MockAudioPlayer>{};\n  bool failNextInit = false;\n  int initCallCount = 0;\n"""
+          if t.count(mock_fields) != 1:
+              raise SystemExit('Unexpected MockJustAudio fields')
+          t = t.replace(mock_fields, mock_fields_new, 1)
+
+          init_anchor = """  Future<AudioPlayerPlatform> init(InitRequest request) async {\n    if (_players.containsKey(request.id)) {\n"""
+          init_new = """  Future<AudioPlayerPlatform> init(InitRequest request) async {\n    initCallCount++;\n    if (failNextInit) {\n      failNextInit = false;\n      throw PlatformException(\n        code: 'init_failed',\n        message: 'Injected platform init failure',\n      );\n    }\n    if (_players.containsKey(request.id)) {\n"""
+          if t.count(init_anchor) != 1:
+              raise SystemExit('Unexpected MockJustAudio init')
+          t = t.replace(init_anchor, init_new, 1)
+
           anchor = """  test('playback start acknowledgment rejects without play intent', () async {\n"""
-          new_test = """  test('playback start acknowledgment fails closed before native dispatch',\n      () async {\n    final player = AudioPlayer();\n    await player.setUrl('https://foo.foo/foo.mp3');\n    final platform = mock.mostRecentPlayer!;\n\n    _ambiguate(TestDefaultBinaryMessengerBinding.instance)!\n        .defaultBinaryMessenger\n        .setMockMethodCallHandler(audioSessionChannel,\n            (MethodCall methodCall) async {\n      throw PlatformException(code: 'activation_failed');\n    });\n\n    final playFuture = player.play();\n    final playExpectation =\n        expectLater(playFuture, throwsA(isA<PlatformException>()));\n    final result = await player.waitForPlaybackStart();\n    await playExpectation;\n\n    expect(result.status, PlaybackStartStatus.failed);\n    expect(result.started, isFalse);\n    expect(platform.playCallCount, 0);\n    expect(platform.awaitPlaybackStartCallCount, 0);\n\n    _ambiguate(TestDefaultBinaryMessengerBinding.instance)!\n        .defaultBinaryMessenger\n        .setMockMethodCallHandler(audioSessionChannel,\n            (MethodCall methodCall) async {\n      return null;\n    });\n    await player.dispose();\n  });\n\n  test('playback start acknowledgment rejects without play intent', () async {\n"""
+          new_test = """  test('playback start acknowledgment fails closed before native dispatch',\n      () async {\n    final player = AudioPlayer(handleAudioSessionActivation: false);\n    await player.setUrl('https://foo.foo/foo.mp3', preload: false);\n    final initCallsBefore = mock.initCallCount;\n    final previousPlatform = mock.mostRecentPlayer;\n    final previousPlayCalls = previousPlatform?.playCallCount;\n    final previousAckCalls = previousPlatform?.awaitPlaybackStartCallCount;\n    mock.failNextInit = true;\n\n    unawaited(player.play());\n    final result = await player.waitForPlaybackStart();\n\n    expect(result.status, PlaybackStartStatus.failed);\n    expect(result.started, isFalse);\n    expect(result.errorMessage, contains('not dispatched'));\n    expect(mock.initCallCount, initCallsBefore + 1);\n    expect(mock.failNextInit, isFalse);\n    expect(mock.mostRecentPlayer, same(previousPlatform));\n    expect(previousPlatform?.playCallCount, previousPlayCalls);\n    expect(previousPlatform?.awaitPlaybackStartCallCount, previousAckCalls);\n\n    await player.stop();\n    await player.dispose();\n  });\n\n  test('playback start acknowledgment rejects without play intent', () async {\n"""
           if t.count(anchor) != 1:
               raise SystemExit('Unexpected playback ack test anchor')
           test.write_text(t.replace(anchor, new_test, 1))
