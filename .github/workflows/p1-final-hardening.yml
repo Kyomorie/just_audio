@@ -1,0 +1,194 @@
+name: P1 final hardening
+
+on:
+  push:
+    branches:
+      - automation/p1-just-audio-apply
+    paths:
+      - .github/workflows/p1-final-hardening.yml
+
+permissions: {}
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: feat/backend-playback-ack
+          fetch-depth: 4
+
+      - name: Verify exact target head
+        shell: bash
+        run: |
+          expected='00801e5151ec85cae467dcfce0da66c371da0b4a'
+          actual="$(git rev-parse HEAD)"
+          [[ "$actual" == "$expected" ]] || { echo "Unexpected target head: $actual" >&2; exit 1; }
+
+      - name: Apply explicit playback status mapping
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          p = Path('just_audio/lib/just_audio.dart')
+          text = p.read_text()
+          old = """  factory PlaybackStartResult._fromMessage(
+              AwaitPlaybackStartResponse response) {
+            return PlaybackStartResult(
+              PlaybackStartStatus.values[response.status.index],
+              errorMessage: response.errorMessage,
+            );
+          }
+          """
+          new = """  factory PlaybackStartResult._fromMessage(
+              AwaitPlaybackStartResponse response) {
+            late final PlaybackStartStatus status;
+            switch (response.status) {
+              case PlaybackStartStatusMessage.started:
+                status = PlaybackStartStatus.started;
+                break;
+              case PlaybackStartStatusMessage.superseded:
+                status = PlaybackStartStatus.superseded;
+                break;
+              case PlaybackStartStatusMessage.rejected:
+                status = PlaybackStartStatus.rejected;
+                break;
+              case PlaybackStartStatusMessage.failed:
+                status = PlaybackStartStatus.failed;
+                break;
+              case PlaybackStartStatusMessage.unsupported:
+                status = PlaybackStartStatus.unsupported;
+                break;
+            }
+            return PlaybackStartResult(
+              status,
+              errorMessage: response.errorMessage,
+            );
+          }
+          """
+          if text.count(old) != 1:
+              raise SystemExit('Unexpected PlaybackStartResult mapping')
+          p.write_text(text.replace(old, new, 1))
+          PY
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Validate explicit status mapping
+        working-directory: just_audio
+        shell: bash
+        run: |
+          flutter pub get --no-example
+          git checkout -- analysis_options.yaml
+          dart format lib/just_audio.dart
+          git diff --check
+          actual="$(git -C .. diff --name-only | sort)"
+          expected='just_audio/lib/just_audio.dart'
+          [[ "$actual" == "$expected" ]] || { printf 'Unexpected mapping paths:\n%s\n' "$actual" >&2; exit 1; }
+          flutter analyze lib --no-fatal-warnings 2>&1 | tee /tmp/analyze-mapping.txt
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+          issues = [line for line in Path('/tmp/analyze-mapping.txt').read_text().splitlines() if re.match(r'^\s*(error|warning|info) •', line)]
+          if len(issues) != 1 or 'warning •' not in issues[0] or 'unawaited_return_in_try_block' not in issues[0]:
+              raise SystemExit(f'Unexpected analyzer issues: {issues}')
+          PY
+          flutter test test/just_audio_test.dart
+          git checkout -- analysis_options.yaml
+          rm -rf .dart_tool
+          rm -f pubspec.lock
+          git -C .. diff --check
+          actual="$(git -C .. diff --name-only | sort)"
+          [[ "$actual" == "$expected" ]] || { printf 'Unexpected mapping paths after validation:\n%s\n' "$actual" >&2; exit 1; }
+
+      - name: Commit explicit status mapping
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add just_audio/lib/just_audio.dart
+          git commit -m 'fix: map playback start statuses explicitly'
+          [[ "$(git rev-parse HEAD^)" == '00801e5151ec85cae467dcfce0da66c371da0b4a' ]] || { echo 'Unexpected mapping parent' >&2; exit 1; }
+          [[ "$(git diff --name-only HEAD^ HEAD)" == 'just_audio/lib/just_audio.dart' ]] || { git diff --name-only HEAD^ HEAD >&2; exit 1; }
+
+      - name: Apply Darwin completion acknowledgment
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          p = Path('just_audio/darwin/just_audio/Sources/just_audio/AudioPlayer.m')
+          text = p.read_text()
+          old = """- (void)complete {
+              [self updatePosition];
+              _processingState = psCompleted;
+              [self broadcastPlaybackEvent];
+              if (_playResult) {
+                  //NSLog(@\"PLAY FINISHED DUE TO COMPLETE\");
+                  _playResult(@{});
+                  _playResult = nil;
+              }
+          }
+          """
+          new = """- (void)complete {
+              [self updatePosition];
+              _processingState = psCompleted;
+              [self evaluatePlaybackStart];
+              [self broadcastPlaybackEvent];
+              if (_playResult) {
+                  //NSLog(@\"PLAY FINISHED DUE TO COMPLETE\");
+                  _playResult(@{});
+                  _playResult = nil;
+              }
+          }
+          """
+          if text.count(old) != 1:
+              raise SystemExit('Unexpected Darwin complete implementation')
+          p.write_text(text.replace(old, new, 1))
+          PY
+          git diff --check
+          actual="$(git diff --name-only | sort)"
+          expected='just_audio/darwin/just_audio/Sources/just_audio/AudioPlayer.m'
+          [[ "$actual" == "$expected" ]] || { printf 'Unexpected Darwin paths:\n%s\n' "$actual" >&2; exit 1; }
+          python3 <<'PY'
+          from pathlib import Path
+          text = Path('just_audio/darwin/just_audio/Sources/just_audio/AudioPlayer.m').read_text()
+          start = text.index('- (void)complete {')
+          end = text.index('\n}\n', start)
+          body = text[start:end]
+          completed = body.index('_processingState = psCompleted;')
+          evaluate = body.index('[self evaluatePlaybackStart];')
+          broadcast = body.index('[self broadcastPlaybackEvent];')
+          if not (completed < evaluate < broadcast):
+              raise SystemExit('Darwin completion ordering contract failed')
+          PY
+
+      - name: Commit Darwin completion acknowledgment
+        shell: bash
+        run: |
+          git add just_audio/darwin/just_audio/Sources/just_audio/AudioPlayer.m
+          git commit -m 'fix: settle playback start ack on Darwin completion'
+          [[ "$(git diff --name-only HEAD^ HEAD)" == 'just_audio/darwin/just_audio/Sources/just_audio/AudioPlayer.m' ]] || { git diff --name-only HEAD^ HEAD >&2; exit 1; }
+          [[ -z "$(git status --porcelain)" ]] || { git status --short >&2; exit 1; }
+
+      - name: Validate two-commit chain
+        shell: bash
+        run: |
+          [[ "$(git rev-parse HEAD^^)" == '00801e5151ec85cae467dcfce0da66c371da0b4a' ]] || { echo 'Unexpected chain base' >&2; exit 1; }
+          [[ "$(git log -1 --format=%s HEAD^)" == 'fix: map playback start statuses explicitly' ]] || exit 1
+          [[ "$(git log -1 --format=%s HEAD)" == 'fix: settle playback start ack on Darwin completion' ]] || exit 1
+          git diff --check HEAD^^ HEAD
+
+      - name: Push only if target is unchanged
+        shell: bash
+        run: |
+          expected='00801e5151ec85cae467dcfce0da66c371da0b4a'
+          remote_head="$(git ls-remote origin refs/heads/feat/backend-playback-ack | cut -f1)"
+          [[ "$remote_head" == "$expected" ]] || { echo "Target moved externally: $remote_head" >&2; exit 1; }
+          [[ "$(git rev-parse HEAD^^)" == "$expected" ]] || { echo 'Unexpected parent chain' >&2; exit 1; }
+          [[ -z "$(git status --porcelain)" ]] || { git status --short >&2; exit 1; }
+          git push origin HEAD:refs/heads/feat/backend-playback-ack
