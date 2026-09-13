@@ -37,6 +37,33 @@ JustAudioPlatform get _pluginPlatform {
   return pluginPlatform;
 }
 
+/// Result of waiting for backend-confirmed effective playback.
+enum PlaybackStartStatus {
+  started,
+  superseded,
+  rejected,
+  failed,
+  unsupported,
+}
+
+/// A backend-confirmed playback-start result.
+class PlaybackStartResult {
+  final PlaybackStartStatus status;
+  final String? errorMessage;
+
+  const PlaybackStartResult(this.status, {this.errorMessage});
+
+  bool get started => status == PlaybackStartStatus.started;
+
+  factory PlaybackStartResult._fromMessage(
+      AwaitPlaybackStartResponse response) {
+    return PlaybackStartResult(
+      PlaybackStartStatus.values[response.status.index],
+      errorMessage: response.errorMessage,
+    );
+  }
+}
+
 /// An audio player that plays a gapless playlist of [AudioSource]s.
 ///
 /// ```
@@ -143,6 +170,7 @@ class AudioPlayer {
 
   // independent streams
   final _playingSubject = BehaviorSubject.seeded(false);
+  final _effectivePlayingSubject = BehaviorSubject.seeded(false);
   final _volumeSubject = BehaviorSubject.seeded(1.0);
   final _speedSubject = BehaviorSubject.seeded(1.0);
   final _pitchSubject = BehaviorSubject.seeded(1.0);
@@ -491,6 +519,16 @@ class AudioPlayer {
 
   /// A stream of changing [playing] states.
   Stream<bool> get playingStream => _playingSubject.stream.distinct();
+
+  /// Whether the backend is currently rendering the active source.
+  ///
+  /// Unlike [playing], this is not playback intent. It is confirmed by the
+  /// backend and becomes false while playback is not effectively running.
+  bool get effectivePlaying => _effectivePlayingSubject.nvalue!;
+
+  /// A stream of backend-confirmed effective playback changes.
+  Stream<bool> get effectivePlayingStream =>
+      _effectivePlayingSubject.stream.distinct();
 
   /// The current volume of the player.
   double get volume => _volumeSubject.nvalue!;
@@ -1144,6 +1182,52 @@ class AudioPlayer {
     await (await _platform).pause(PauseRequest());
   }
 
+  /// Waits for the native backend to confirm effective playback for
+  /// the currently loaded source. This does not infer success from [playing],
+  /// audio-session activation, elapsed time, or position movement.
+  Future<PlaybackStartResult> waitForPlaybackStart() async {
+    if (_disposed) {
+      return const PlaybackStartResult(
+        PlaybackStartStatus.failed,
+        errorMessage: 'Player disposed',
+      );
+    }
+    if (!playing) {
+      return const PlaybackStartResult(PlaybackStartStatus.rejected);
+    }
+
+    try {
+      final activation = _setPlatformActive(true);
+      if (activation != null) {
+        await activation;
+      }
+      if (_disposed) {
+        return const PlaybackStartResult(
+          PlaybackStartStatus.failed,
+          errorMessage: 'Player disposed',
+        );
+      }
+      if (!playing) {
+        return const PlaybackStartResult(PlaybackStartStatus.superseded);
+      }
+      final platform = await _platform;
+      final response = await platform.awaitPlaybackStart(
+        AwaitPlaybackStartRequest(attemptId: _uuid.v4()),
+      );
+      return PlaybackStartResult._fromMessage(response);
+    } on PlayerInterruptedException catch (error) {
+      return PlaybackStartResult(
+        PlaybackStartStatus.superseded,
+        errorMessage: error.message,
+      );
+    } catch (error) {
+      return PlaybackStartResult(
+        PlaybackStartStatus.failed,
+        errorMessage: error.toString(),
+      );
+    }
+  }
+
   Future<void> _sendPlayRequest(
       AudioPlayerPlatform platform, Completer<void>? playCompleter) async {
     try {
@@ -1441,6 +1525,7 @@ class AudioPlayer {
       await _playbackEventSubject.close();
       await _sequenceStateSubject.close();
       await _playingSubject.close();
+      await _effectivePlayingSubject.close();
       await _volumeSubject.close();
       await _speedSubject.close();
       await _pitchSubject.close();
@@ -1518,6 +1603,9 @@ class AudioPlayer {
     // This method updates _active and _platform before yielding to the next
     // task in the event loop.
     _active = active;
+    if (!active && effectivePlaying) {
+      _effectivePlayingSubject.add(false);
+    }
     final position = this.position;
     final currentIndex = this.currentIndex;
     final playlist = _playlist;
@@ -1528,6 +1616,10 @@ class AudioPlayer {
         if (message.playing != null && message.playing != playing) {
           _playerEventSubject
               .add(playerEvent.copyWith(playing: message.playing!));
+        }
+        if (message.effectivePlaying != null &&
+            message.effectivePlaying != effectivePlaying) {
+          _effectivePlayingSubject.add(message.effectivePlaying!);
         }
         if (message.volume != null) {
           _volumeSubject.add(message.volume!);
