@@ -1,0 +1,106 @@
+name: P2 Darwin confirmed seek hardening
+
+on:
+  push:
+    branches:
+      - automation/p2-confirmed-seek
+    paths:
+      - '.github/workflows/p2-darwin-confirmed-seek-hardening.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  harden:
+    runs-on: macos-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: automation/p2-confirmed-seek
+          fetch-depth: 0
+
+      - name: Verify candidate
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD^)" = "2530f9e3cce68fd49de4eb273f2dc1c7c97d9935"
+          test -z "$(git diff --name-only 7ebf64cb1e0e5ea8fa586db5ce7b4e5b45baccb5...HEAD | grep -v '^\.github/')"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Resolve packages
+        shell: bash
+        run: |
+          (cd just_audio_platform_interface && flutter pub get --no-example)
+          (cd just_audio && flutter pub get --no-example)
+          git checkout -- just_audio_platform_interface/analysis_options.yaml just_audio/analysis_options.yaml
+
+      - name: Apply Darwin ownership hardening
+        shell: bash
+        run: |
+          python3 .github/scripts/harden-p2-darwin-confirmed-seek.py
+          git diff --check
+          test "$(git diff --name-only | grep -v '^\.github/')" = "just_audio/darwin/just_audio/Sources/just_audio/AudioPlayer.m"
+          grep -q '_confirmedSeekSourceEpoch' just_audio/darwin/just_audio/Sources/just_audio/AudioPlayer.m
+          grep -q '_confirmedSeekControlEpoch' just_audio/darwin/just_audio/Sources/just_audio/AudioPlayer.m
+          grep -q '_confirmedSeekAttemptId' just_audio/darwin/just_audio/Sources/just_audio/AudioPlayer.m
+          grep -q 'seekInternal' just_audio/darwin/just_audio/Sources/just_audio/AudioPlayer.m
+
+      - name: Analyze and test
+        working-directory: just_audio
+        run: |
+          flutter analyze lib test --no-fatal-warnings
+          flutter test
+
+      - name: Create macOS smoke host
+        run: flutter create --platforms=macos --org dev.kyomorie /tmp/p2_darwin_hardened
+
+      - name: Point smoke host at candidate
+        shell: bash
+        run: |
+          ROOT="$GITHUB_WORKSPACE"
+          cat > /tmp/p2_darwin_hardened/pubspec.yaml <<EOF
+          name: p2_darwin_hardened
+          publish_to: none
+          environment:
+            sdk: ">=3.1.3 <4.0.0"
+          dependencies:
+            flutter:
+              sdk: flutter
+            just_audio:
+              path: $ROOT/just_audio
+          flutter:
+            uses-material-design: true
+          EOF
+          cat > /tmp/p2_darwin_hardened/lib/main.dart <<'EOF'
+          import 'package:flutter/widgets.dart';
+          import 'package:just_audio/just_audio.dart';
+          void main() {
+            WidgetsFlutterBinding.ensureInitialized();
+            final player = AudioPlayer();
+            player.seekConfirmed(const Duration(seconds: 1));
+            runApp(const SizedBox.shrink());
+          }
+          EOF
+
+      - name: macOS debug compile
+        working-directory: /tmp/p2_darwin_hardened
+        run: |
+          flutter pub get
+          flutter build macos --debug
+
+      - name: Commit exact source change
+        shell: bash
+        run: |
+          git checkout -- just_audio_platform_interface/analysis_options.yaml just_audio/analysis_options.yaml
+          git checkout -- just_audio_platform_interface/pubspec.lock just_audio/pubspec.lock 2>/dev/null || true
+          git diff --check
+          test "$(git diff --name-only | grep -v '^\.github/')" = "just_audio/darwin/just_audio/Sources/just_audio/AudioPlayer.m"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add just_audio/darwin/just_audio/Sources/just_audio/AudioPlayer.m
+          git commit -m "fix: bind Darwin confirmed seek to mutation epochs"
+          git push origin HEAD:automation/p2-confirmed-seek
