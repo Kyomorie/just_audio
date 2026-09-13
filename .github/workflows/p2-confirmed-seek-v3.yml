@@ -35,22 +35,34 @@ jobs:
           (cd just_audio_platform_interface && flutter pub get --no-example)
           (cd just_audio && flutter pub get --no-example)
           git checkout -- just_audio_platform_interface/analysis_options.yaml just_audio/analysis_options.yaml
-      - name: Align staging helper with exact Android source
+      - name: Stage exact Android baseline for helper
         shell: bash
         run: |
           python3 <<'PY'
           from pathlib import Path
-          path = Path('.github/scripts/apply-p2-confirmed-seek-v2.py')
+          path = Path('just_audio/android/src/main/java/com/ryanheise/just_audio/AudioPlayer.java')
           text = path.read_text()
-          old = r'completePlaybackStart(\"rejected\", null);'
-          new = r'completePlaybackStart(\"rejected\", \"Playback completed before start acknowledgment\");'
-          count = text.count(old)
-          if count != 2:
-              raise SystemExit(f'Expected two STATE_ENDED helper literals, found {count}')
-          path.write_text(text.replace(old, new))
+          old = 'completePlaybackStart("rejected", "Playback completed before start acknowledgment");'
+          new = 'completePlaybackStart("rejected", null);'
+          if text.count(old) != 1:
+              raise SystemExit(f'Expected one P1 STATE_ENDED line, found {text.count(old)}')
+          path.write_text(text.replace(old, new, 1))
           PY
       - name: Apply confirmed seek contract
         run: python3 .github/scripts/apply-p2-confirmed-seek-v2.py
+      - name: Restore P1 terminal message
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          path = Path('just_audio/android/src/main/java/com/ryanheise/just_audio/AudioPlayer.java')
+          text = path.read_text()
+          old = 'completePlaybackStart("rejected", null);\n            completeConfirmedSeek("rejected", null, false);'
+          new = 'completePlaybackStart("rejected", "Playback completed before start acknowledgment");\n            completeConfirmedSeek("rejected", null, false);'
+          if text.count(old) != 1:
+              raise SystemExit(f'Expected one generated STATE_ENDED block, found {text.count(old)}')
+          path.write_text(text.replace(old, new, 1))
+          PY
       - name: Format and diff-check
         shell: bash
         run: |
@@ -116,7 +128,6 @@ jobs:
       - name: Restore toolchain side effects and enforce source scope
         shell: bash
         run: |
-          git checkout -- .github/scripts/apply-p2-confirmed-seek-v2.py
           git checkout -- just_audio_platform_interface/analysis_options.yaml just_audio/analysis_options.yaml
           git checkout -- just_audio_platform_interface/pubspec.lock just_audio/pubspec.lock 2>/dev/null || true
           git diff --check
