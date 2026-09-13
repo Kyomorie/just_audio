@@ -187,6 +187,23 @@
             [self seek:position index:request[@"index"] completionHandler:^(BOOL finished) {
                 result(@{});
             }];
+        } else if ([@"seekConfirmed" isEqualToString:call.method]) {
+            if (_processingState == psIdle || _processingState == psLoading || request[@"position"] == (id)[NSNull null]) {
+                result(@{@"status": @"rejected"});
+            } else {
+                CMTime position = CMTimeMake([request[@"position"] longLongValue], 1000000);
+                [self seek:position index:request[@"index"] completionHandler:^(BOOL finished) {
+                    if (!finished) {
+                        result(@{@"status": @"superseded"});
+                        return;
+                    }
+                    result(@{
+                        @"status": @"reached",
+                        @"actualPosition": @((long long)[self getCurrentPosition] * 1000LL),
+                        @"actualIndex": @(self->_index),
+                    });
+                }];
+            }
         } else if ([@"concatenatingInsertAll" isEqualToString:call.method]) {
             [self concatenatingInsertAll:(NSString *)request[@"id"] index:[request[@"index"] intValue] sources:(NSArray *)request[@"children"] shuffleOrder:(NSArray<NSNumber *> *)request[@"shuffleOrder"]];
             result(@{});

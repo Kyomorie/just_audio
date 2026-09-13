@@ -91,6 +91,7 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
     private Result prepareResult;
     private Result playResult;
     private Result seekResult;
+    private Result confirmedSeekResult;
     private Map<String, MediaSource> mediaSources = new HashMap<String, MediaSource>();
     private IcyInfo icyInfo;
     private IcyHeaders icyHeaders;
@@ -340,8 +341,14 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
         updatePosition();
         switch (reason) {
         case Player.DISCONTINUITY_REASON_AUTO_TRANSITION:
+            updateCurrentIndex();
+            completeConfirmedSeek("superseded", null, false);
+            break;
         case Player.DISCONTINUITY_REASON_SEEK:
             updateCurrentIndex();
+            if (confirmedSeekResult != null) {
+                completeConfirmedSeek("reached", null, true);
+            }
             break;
         }
         broadcastImmediatePlaybackEvent();
@@ -419,6 +426,7 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
             break;
         case Player.STATE_ENDED:
             completePlaybackStart("rejected", "Playback completed before start acknowledgment");
+            completeConfirmedSeek("rejected", null, false);
             if (processingState != ProcessingState.completed) {
                 updatePosition();
                 processingState = ProcessingState.completed;
@@ -446,6 +454,7 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
 
     @Override
     public void onPlayerError(PlaybackException error) {
+        completeConfirmedSeek("failed", error.getMessage(), false);
         completePlaybackStart("failed", error.getMessage());
         if (error instanceof ExoPlaybackException) {
             final ExoPlaybackException exoError = (ExoPlaybackException)error;
@@ -546,6 +555,14 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
                 Long position = getLong(call.argument("position"));
                 Integer index = call.argument("index");
                 seek(position == null ? C.TIME_UNSET : position / 1000, index, result);
+                break;
+            case "seekConfirmed":
+                Long confirmedPosition = getLong(call.argument("position"));
+                Integer confirmedIndex = call.argument("index");
+                seekConfirmed(
+                    confirmedPosition == null ? C.TIME_UNSET : confirmedPosition / 1000,
+                    confirmedIndex,
+                    result);
                 break;
             case "concatenatingInsertAll":
                 if (((String)call.argument("id")).length() == 0) {
@@ -1153,11 +1170,13 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
         playbackSourceEpoch++;
         playbackControlEpoch++;
         completePlaybackStart("superseded", null);
+        completeConfirmedSeek("superseded", null, false);
     }
 
     private void advancePlaybackControlEpoch() {
         playbackControlEpoch++;
         completePlaybackStart("superseded", null);
+        completeConfirmedSeek("superseded", null, false);
     }
 
     private void evaluatePlaybackStart() {
@@ -1271,6 +1290,56 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
 
     public void setShuffleModeEnabled(final boolean enabled) {
         player.setShuffleModeEnabled(enabled);
+    }
+
+    public void seekConfirmed(
+            final long position,
+            final Integer index,
+            final Result result) {
+        advancePlaybackControlEpoch();
+        if (position == C.TIME_UNSET ||
+                player == null ||
+                player.getMediaItemCount() == 0 ||
+                processingState == ProcessingState.idle ||
+                processingState == ProcessingState.loading) {
+            Map<String, Object> response = new HashMap<>();
+            response.put("status", "rejected");
+            result.success(response);
+            return;
+        }
+        abortSeek();
+        confirmedSeekResult = result;
+        seekPos = position;
+        try {
+            int windowIndex = index != null ? index : player.getCurrentMediaItemIndex();
+            if (windowIndex < 0 || windowIndex >= player.getMediaItemCount()) {
+                completeConfirmedSeek("rejected", null, false);
+                return;
+            }
+            player.seekTo(windowIndex, position);
+        } catch (RuntimeException e) {
+            completeConfirmedSeek("failed", e.getMessage(), false);
+        }
+    }
+
+    private void completeConfirmedSeek(
+            String status,
+            String errorMessage,
+            boolean includeActualPosition) {
+        Result result = confirmedSeekResult;
+        if (result == null) return;
+        confirmedSeekResult = null;
+        seekPos = null;
+        Map<String, Object> response = new HashMap<>();
+        response.put("status", status);
+        if (includeActualPosition && player != null) {
+            response.put("actualPosition", 1000L * player.getCurrentPosition());
+            response.put("actualIndex", player.getCurrentMediaItemIndex());
+        }
+        if (errorMessage != null) {
+            response.put("errorMessage", errorMessage);
+        }
+        result.success(response);
     }
 
     public void seek(final long position, final Integer index, final Result result) {
