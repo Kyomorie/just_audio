@@ -35,6 +35,19 @@ jobs:
           (cd just_audio_platform_interface && flutter pub get --no-example)
           (cd just_audio && flutter pub get --no-example)
           git checkout -- just_audio_platform_interface/analysis_options.yaml just_audio/analysis_options.yaml
+      - name: Align staging script with exact Android source
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          path = Path('.github/scripts/apply-p2-confirmed-seek-v2.py')
+          text = path.read_text()
+          old = '''    android,\n    \'\'\'        case Player.STATE_ENDED:\\n            completePlaybackStart(\\"rejected\\", null);\\n\'\'\',\n    \'\'\'        case Player.STATE_ENDED:\\n            completePlaybackStart(\\"rejected\\", null);\\n            completeConfirmedSeek(\\"rejected\\", null, false);\\n\'\'\',\n)'''
+          new = '''    android,\n    \'\'\'        case Player.STATE_ENDED:\\n            completePlaybackStart(\\"rejected\\", \\"Playback completed before start acknowledgment\\");\\n\'\'\',\n    \'\'\'        case Player.STATE_ENDED:\\n            completePlaybackStart(\\"rejected\\", \\"Playback completed before start acknowledgment\\");\\n            completeConfirmedSeek(\\"rejected\\", null, false);\\n\'\'\',\n)'''
+          if text.count(old) != 1:
+              raise SystemExit('STATE_ENDED staging anchor mismatch')
+          path.write_text(text.replace(old, new, 1))
+          PY
       - name: Apply confirmed seek contract
         run: python3 .github/scripts/apply-p2-confirmed-seek-v2.py
       - name: Format and diff-check
@@ -102,6 +115,7 @@ jobs:
       - name: Restore toolchain side effects and enforce source scope
         shell: bash
         run: |
+          git checkout -- .github/scripts/apply-p2-confirmed-seek-v2.py
           git checkout -- just_audio_platform_interface/analysis_options.yaml just_audio/analysis_options.yaml
           git checkout -- just_audio_platform_interface/pubspec.lock just_audio/pubspec.lock 2>/dev/null || true
           git diff --check
