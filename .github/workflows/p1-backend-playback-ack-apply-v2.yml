@@ -1,0 +1,147 @@
+name: P1 backend playback acknowledgment apply v2
+
+on:
+  push:
+    branches:
+      - automation/p1-just-audio-apply
+    paths:
+      - .github/workflows/p1-backend-playback-ack-apply-v2.yml
+
+permissions: {}
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout automation source
+        uses: actions/checkout@v6
+        with:
+          ref: automation/p1-just-audio-apply
+          path: automation
+          fetch-depth: 1
+
+      - name: Checkout exact target branch
+        uses: actions/checkout@v6
+        with:
+          ref: feat/backend-playback-ack
+          path: target
+          fetch-depth: 2
+
+      - name: Verify exact target head
+        working-directory: target
+        shell: bash
+        run: |
+          expected='a7db3a1a939c2182239d44d0fe52ef54364f103d'
+          actual="$(git rev-parse HEAD)"
+          if [[ "$actual" != "$expected" ]]; then
+            echo "Unexpected target head: $actual" >&2
+            exit 1
+          fi
+
+      - name: Extract and apply asserted source patch
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          import textwrap
+
+          workflow = Path('automation/.github/workflows/p1-backend-playback-ack-apply.yml').read_text()
+          marker = "          python3 <<'PY'\n"
+          start = workflow.index(marker) + len(marker)
+          end = workflow.index("\n          PY\n", start)
+          script = textwrap.dedent(workflow[start:end])
+          Path('/tmp/p1_apply.py').write_text(script)
+          PY
+          cd target
+          python3 /tmp/p1_apply.py
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Resolve package language versions
+        shell: bash
+        run: |
+          (cd target/just_audio_platform_interface && flutter pub get)
+          (cd target/just_audio && flutter pub get)
+
+      - name: Format Dart sources
+        working-directory: target
+        shell: bash
+        run: |
+          dart format \
+            just_audio_platform_interface/lib/just_audio_platform_interface.dart \
+            just_audio_platform_interface/lib/method_channel_just_audio.dart \
+            just_audio/lib/just_audio.dart
+          git diff --check
+
+      - name: Validate changed paths
+        working-directory: target
+        shell: bash
+        run: |
+          actual="$(git diff --name-only | sort)"
+          expected="$(printf '%s\n' \
+            just_audio/android/src/main/java/com/ryanheise/just_audio/AudioPlayer.java \
+            just_audio/darwin/just_audio/Sources/just_audio/AudioPlayer.m \
+            just_audio/lib/just_audio.dart \
+            just_audio_platform_interface/lib/just_audio_platform_interface.dart \
+            just_audio_platform_interface/lib/method_channel_just_audio.dart | sort)"
+          if [[ "$actual" != "$expected" ]]; then
+            echo 'Unexpected changed paths:' >&2
+            printf '%s\n' "$actual" >&2
+            exit 1
+          fi
+
+      - name: Analyze and test platform interface
+        working-directory: target/just_audio_platform_interface
+        shell: bash
+        run: |
+          flutter analyze
+          flutter test
+
+      - name: Analyze and test just_audio
+        working-directory: target/just_audio
+        shell: bash
+        run: |
+          flutter analyze lib
+          flutter test
+
+      - name: Commit validated source
+        working-directory: target
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add \
+            just_audio/android/src/main/java/com/ryanheise/just_audio/AudioPlayer.java \
+            just_audio/darwin/just_audio/Sources/just_audio/AudioPlayer.m \
+            just_audio/lib/just_audio.dart \
+            just_audio_platform_interface/lib/just_audio_platform_interface.dart \
+            just_audio_platform_interface/lib/method_channel_just_audio.dart
+          git commit -m 'feat: add backend playback start acknowledgment'
+
+      - name: Push only if target branch is unchanged
+        working-directory: target
+        shell: bash
+        run: |
+          expected='a7db3a1a939c2182239d44d0fe52ef54364f103d'
+          remote_head="$(git ls-remote origin refs/heads/feat/backend-playback-ack | cut -f1)"
+          if [[ "$remote_head" != "$expected" ]]; then
+            echo "Target branch moved externally: $remote_head" >&2
+            exit 1
+          fi
+          if [[ "$(git rev-parse HEAD^)" != "$expected" ]]; then
+            echo 'Validated source commit has unexpected parent.' >&2
+            exit 1
+          fi
+          if [[ -n "$(git status --porcelain)" ]]; then
+            echo 'Working tree is dirty after validation.' >&2
+            git status --short >&2
+            exit 1
+          fi
+          git push origin HEAD:refs/heads/feat/backend-playback-ack
