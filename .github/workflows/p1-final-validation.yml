@@ -1,0 +1,251 @@
+name: P1 final validation
+
+on:
+  push:
+    branches:
+      - automation/p1-just-audio-apply
+    paths:
+      - .github/workflows/p1-final-validation.yml
+
+permissions:
+  contents: read
+
+env:
+  JUST_AUDIO_SHA: 736085f3dc31d597236ff7c773ba448fb0db9c67
+  MEDIA_KIT_SHA: c1a5a15046ab565613c2d1e8736152aef9b6348c
+
+jobs:
+  android-native:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: 736085f3dc31d597236ff7c773ba448fb0db9c67
+      - name: Verify exact just_audio source
+        shell: bash
+        run: |
+          [[ "$(git rev-parse HEAD)" == "$JUST_AUDIO_SHA" ]] || exit 1
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Create Android compile host
+        shell: bash
+        run: |
+          flutter create --platforms=android --org dev.kyomorie /tmp/p1_android_smoke
+          python3 <<'PY'
+          import os
+          from pathlib import Path
+          root = Path(os.environ['GITHUB_WORKSPACE'])
+          Path('/tmp/p1_android_smoke/pubspec.yaml').write_text(f'''name: p1_android_smoke
+          publish_to: none
+          environment:
+            sdk: ">=3.1.3 <4.0.0"
+          dependencies:
+            flutter:
+              sdk: flutter
+            just_audio:
+              path: {root / 'just_audio'}
+          flutter:
+            uses-material-design: true
+          '''.replace('          ', ''))
+          Path('/tmp/p1_android_smoke/lib/main.dart').write_text('''import 'package:flutter/widgets.dart';
+          import 'package:just_audio/just_audio.dart';
+
+          void main() {
+            WidgetsFlutterBinding.ensureInitialized();
+            AudioPlayer();
+            runApp(const SizedBox.shrink());
+          }
+          '''.replace('          ', ''))
+          PY
+      - name: Compile Android plugin integration
+        working-directory: /tmp/p1_android_smoke
+        shell: bash
+        run: |
+          flutter pub get
+          flutter build apk --debug
+
+  ios-native:
+    runs-on: macos-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: 736085f3dc31d597236ff7c773ba448fb0db9c67
+      - name: Verify exact just_audio source
+        shell: bash
+        run: |
+          [[ "$(git rev-parse HEAD)" == "$JUST_AUDIO_SHA" ]] || exit 1
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Create iOS simulator compile host
+        shell: bash
+        run: |
+          flutter create --platforms=ios --org dev.kyomorie /tmp/p1_ios_smoke
+          python3 <<'PY'
+          import os
+          from pathlib import Path
+          root = Path(os.environ['GITHUB_WORKSPACE'])
+          Path('/tmp/p1_ios_smoke/pubspec.yaml').write_text(f'''name: p1_ios_smoke
+          publish_to: none
+          environment:
+            sdk: ">=3.1.3 <4.0.0"
+          dependencies:
+            flutter:
+              sdk: flutter
+            just_audio:
+              path: {root / 'just_audio'}
+          flutter:
+            uses-material-design: true
+          '''.replace('          ', ''))
+          Path('/tmp/p1_ios_smoke/lib/main.dart').write_text('''import 'package:flutter/widgets.dart';
+          import 'package:just_audio/just_audio.dart';
+
+          void main() {
+            WidgetsFlutterBinding.ensureInitialized();
+            AudioPlayer();
+            runApp(const SizedBox.shrink());
+          }
+          '''.replace('          ', ''))
+          PY
+      - name: Compile iOS simulator plugin integration
+        working-directory: /tmp/p1_ios_smoke
+        shell: bash
+        run: |
+          flutter pub get
+          flutter build ios --simulator --debug
+
+  linux-desktop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: 736085f3dc31d597236ff7c773ba448fb0db9c67
+      - uses: actions/checkout@v6
+        with:
+          repository: Kyomorie/just_audio_media_kit
+          ref: c1a5a15046ab565613c2d1e8736152aef9b6348c
+          path: media_kit_adapter
+      - name: Verify exact integrated heads
+        shell: bash
+        run: |
+          [[ "$(git rev-parse HEAD)" == "$JUST_AUDIO_SHA" ]] || exit 1
+          [[ "$(git -C media_kit_adapter rev-parse HEAD)" == "$MEDIA_KIT_SHA" ]] || exit 1
+      - name: Install Linux Flutter build dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Create Linux integration host
+        shell: bash
+        run: |
+          flutter create --platforms=linux --org dev.kyomorie /tmp/p1_linux_smoke
+          python3 <<'PY'
+          import os
+          from pathlib import Path
+          root = Path(os.environ['GITHUB_WORKSPACE'])
+          Path('/tmp/p1_linux_smoke/pubspec.yaml').write_text(f'''name: p1_linux_smoke
+          publish_to: none
+          environment:
+            sdk: ">=3.1.3 <4.0.0"
+          dependencies:
+            flutter:
+              sdk: flutter
+            just_audio:
+              path: {root / 'just_audio'}
+            just_audio_media_kit:
+              path: {root / 'media_kit_adapter'}
+            media_kit_libs_linux: any
+          flutter:
+            uses-material-design: true
+          '''.replace('          ', ''))
+          Path('/tmp/p1_linux_smoke/lib/main.dart').write_text('''import 'package:flutter/widgets.dart';
+          import 'package:just_audio/just_audio.dart';
+          import 'package:just_audio_media_kit/just_audio_media_kit.dart';
+
+          void main() {
+            WidgetsFlutterBinding.ensureInitialized();
+            JustAudioMediaKit.ensureInitialized();
+            AudioPlayer();
+            runApp(const SizedBox.shrink());
+          }
+          '''.replace('          ', ''))
+          PY
+      - name: Build Linux integrated app
+        working-directory: /tmp/p1_linux_smoke
+        shell: bash
+        run: |
+          flutter pub get
+          flutter build linux --debug
+
+  windows-desktop:
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: 736085f3dc31d597236ff7c773ba448fb0db9c67
+      - uses: actions/checkout@v6
+        with:
+          repository: Kyomorie/just_audio_media_kit
+          ref: c1a5a15046ab565613c2d1e8736152aef9b6348c
+          path: media_kit_adapter
+      - name: Verify exact integrated heads
+        shell: pwsh
+        run: |
+          if ((git rev-parse HEAD) -ne $env:JUST_AUDIO_SHA) { exit 1 }
+          if ((git -C media_kit_adapter rev-parse HEAD) -ne $env:MEDIA_KIT_SHA) { exit 1 }
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Create Windows integration host
+        shell: pwsh
+        run: |
+          flutter create --platforms=windows --org dev.kyomorie "$env:RUNNER_TEMP\p1_windows_smoke"
+          $root = $env:GITHUB_WORKSPACE -replace '\\','/'
+          $pubspec = @"
+          name: p1_windows_smoke
+          publish_to: none
+          environment:
+            sdk: ">=3.1.3 <4.0.0"
+          dependencies:
+            flutter:
+              sdk: flutter
+            just_audio:
+              path: $root/just_audio
+            just_audio_media_kit:
+              path: $root/media_kit_adapter
+            media_kit_libs_windows_audio: any
+          flutter:
+            uses-material-design: true
+          "@
+          Set-Content -Path "$env:RUNNER_TEMP\p1_windows_smoke\pubspec.yaml" -Value $pubspec
+          $main = @"
+          import 'package:flutter/widgets.dart';
+          import 'package:just_audio/just_audio.dart';
+          import 'package:just_audio_media_kit/just_audio_media_kit.dart';
+
+          void main() {
+            WidgetsFlutterBinding.ensureInitialized();
+            JustAudioMediaKit.ensureInitialized();
+            AudioPlayer();
+            runApp(const SizedBox.shrink());
+          }
+          "@
+          Set-Content -Path "$env:RUNNER_TEMP\p1_windows_smoke\lib\main.dart" -Value $main
+      - name: Build Windows integrated app
+        shell: pwsh
+        working-directory: ${{ runner.temp }}\p1_windows_smoke
+        run: |
+          flutter pub get
+          flutter build windows --debug
