@@ -1,0 +1,182 @@
+name: P1 play dispatch failure hardening
+
+on:
+  push:
+    branches:
+      - automation/p1-just-audio-apply
+    paths:
+      - .github/workflows/p1-play-dispatch-failure-hardening.yml
+
+permissions: {}
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: feat/backend-playback-ack
+          fetch-depth: 2
+      - name: Verify exact target head
+        shell: bash
+        run: |
+          expected='c6efa2e1415155a6aad515c7f255602b785883c2'
+          actual="$(git rev-parse HEAD)"
+          [[ "$actual" == "$expected" ]] || { echo "Unexpected target head: $actual" >&2; exit 1; }
+      - name: Apply fail-closed dispatch outcome
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          source = Path('just_audio/lib/just_audio.dart')
+          text = source.read_text()
+
+          text = text.replace(
+              '  Completer<void>? _playRequestDispatchCompleter;\n',
+              '  Completer<bool>? _playRequestDispatchCompleter;\n',
+              1,
+          )
+
+          old_helper = """  void _completePlayRequestDispatch(Completer<void>? completer) {\n    if (completer != null && !completer.isCompleted) {\n      completer.complete();\n    }\n    if (identical(_playRequestDispatchCompleter, completer)) {\n      _playRequestDispatchCompleter = null;\n    }\n  }\n"""
+          new_helper = """  void _completePlayRequestDispatch(\n    Completer<bool>? completer, {\n    required bool dispatched,\n  }) {\n    if (completer != null && !completer.isCompleted) {\n      completer.complete(dispatched);\n    }\n    if (identical(_playRequestDispatchCompleter, completer)) {\n      _playRequestDispatchCompleter = null;\n    }\n  }\n"""
+          if text.count(old_helper) != 1:
+              raise SystemExit('Unexpected dispatch helper')
+          text = text.replace(old_helper, new_helper, 1)
+          text = text.replace(
+              'final playRequestDispatchCompleter = Completer<void>();',
+              'final playRequestDispatchCompleter = Completer<bool>();',
+              1,
+          )
+
+          # Every pre-dispatch settlement is explicitly false.
+          text = text.replace(
+              '_completePlayRequestDispatch(playRequestDispatchCompleter);\n          return;',
+              '_completePlayRequestDispatch(\n            playRequestDispatchCompleter,\n            dispatched: false,\n          );\n          return;',
+              1,
+          )
+
+          old_activation = """            if (activation != null) {\n              unawaited(activation.whenComplete(() {\n                _completePlayRequestDispatch(playRequestDispatchCompleter);\n              }).catchError((dynamic e) async => null));\n            } else {\n              _completePlayRequestDispatch(playRequestDispatchCompleter);\n            }\n"""
+          new_activation = """            if (activation != null) {\n              unawaited(activation.then<void>(\n                (_) => _completePlayRequestDispatch(\n                  playRequestDispatchCompleter,\n                  dispatched: false,\n                ),\n                onError: (Object error, StackTrace stackTrace) {\n                  _completePlayRequestDispatch(\n                    playRequestDispatchCompleter,\n                    dispatched: false,\n                  );\n                },\n              ));\n            } else {\n              _completePlayRequestDispatch(\n                playRequestDispatchCompleter,\n                dispatched: false,\n              );\n            }\n"""
+          if text.count(old_activation) != 1:
+              raise SystemExit('Unexpected activation fallback')
+          text = text.replace(old_activation, new_activation, 1)
+
+          # Remaining play() settlements before dispatch are false.
+          play_start = text.index('  Future<void> play() async {')
+          play_end = text.index('\n  /// Pauses the currently playing media.', play_start)
+          play_body = text[play_start:play_end]
+          play_body = play_body.replace(
+              '_completePlayRequestDispatch(playRequestDispatchCompleter);',
+              '_completePlayRequestDispatch(\n          playRequestDispatchCompleter,\n          dispatched: false,\n        );',
+          )
+          text = text[:play_start] + play_body + text[play_end:]
+
+          # pause/stop supersede any not-yet-dispatched attempt.
+          text = text.replace(
+              '_completePlayRequestDispatch(_playRequestDispatchCompleter);',
+              '_completePlayRequestDispatch(\n      _playRequestDispatchCompleter,\n      dispatched: false,\n    );',
+              2,
+          )
+
+          old_wait = """    final playRequestGeneration = _playRequestGeneration;\n    final playRequestDispatchCompleter = _playRequestDispatchCompleter;\n    if (playRequestDispatchCompleter != null &&\n        !playRequestDispatchCompleter.isCompleted) {\n      await playRequestDispatchCompleter.future;\n    }\n    if (_disposed) {\n"""
+          new_wait = """    final playRequestGeneration = _playRequestGeneration;\n    final playRequestDispatchCompleter = _playRequestDispatchCompleter;\n    final playRequestDispatched = playRequestDispatchCompleter == null\n        ? null\n        : await playRequestDispatchCompleter.future;\n    if (_disposed) {\n"""
+          if text.count(old_wait) != 1:
+              raise SystemExit('Unexpected wait dispatch barrier')
+          text = text.replace(old_wait, new_wait, 1)
+
+          wait_anchor = """    if (_playRequestGeneration != playRequestGeneration || !playing) {\n      return const PlaybackStartResult(PlaybackStartStatus.superseded);\n    }\n\n    try {\n"""
+          wait_insert = """    if (_playRequestGeneration != playRequestGeneration || !playing) {\n      return const PlaybackStartResult(PlaybackStartStatus.superseded);\n    }\n    if (playRequestDispatched == false) {\n      return const PlaybackStartResult(\n        PlaybackStartStatus.failed,\n        errorMessage: 'Native play request was not dispatched',\n      );\n    }\n\n    try {\n"""
+          if text.count(wait_anchor) != 1:
+              raise SystemExit('Unexpected pre-activation wait guard')
+          text = text.replace(wait_anchor, wait_insert, 1)
+
+          text = text.replace(
+              'Completer<void>? playRequestDispatchCompleter,',
+              'Completer<bool>? playRequestDispatchCompleter,',
+              2,
+          )
+
+          send_start = text.index('  Future<void> _sendPlayRequest(')
+          send_end = text.index('\n  /// Stops playing audio', send_start)
+          send_body = text[send_start:send_end]
+          send_body = send_body.replace(
+              '_completePlayRequestDispatch(playRequestDispatchCompleter);',
+              '_completePlayRequestDispatch(\n          playRequestDispatchCompleter,\n          dispatched: false,\n        );',
+              1,
+          )
+          send_body = send_body.replace(
+              '_completePlayRequestDispatch(playRequestDispatchCompleter);',
+              '_completePlayRequestDispatch(\n        playRequestDispatchCompleter,\n        dispatched: true,\n      );',
+              1,
+          )
+          text = text[:send_start] + send_body + text[send_end:]
+          source.write_text(text)
+
+          test = Path('just_audio/test/just_audio_test.dart')
+          t = test.read_text()
+          anchor = """  test('playback start acknowledgment rejects without play intent', () async {\n"""
+          new_test = """  test('playback start acknowledgment fails closed before native dispatch',\n      () async {\n    final player = AudioPlayer();\n    await player.setUrl('https://foo.foo/foo.mp3');\n    final platform = mock.mostRecentPlayer!;\n\n    _ambiguate(TestDefaultBinaryMessengerBinding.instance)!\n        .defaultBinaryMessenger\n        .setMockMethodCallHandler(audioSessionChannel,\n            (MethodCall methodCall) async {\n      throw PlatformException(code: 'activation_failed');\n    });\n\n    final playFuture = player.play();\n    final playExpectation =\n        expectLater(playFuture, throwsA(isA<PlatformException>()));\n    final result = await player.waitForPlaybackStart();\n    await playExpectation;\n\n    expect(result.status, PlaybackStartStatus.failed);\n    expect(result.started, isFalse);\n    expect(platform.playCallCount, 0);\n    expect(platform.awaitPlaybackStartCallCount, 0);\n\n    _ambiguate(TestDefaultBinaryMessengerBinding.instance)!\n        .defaultBinaryMessenger\n        .setMockMethodCallHandler(audioSessionChannel,\n            (MethodCall methodCall) async {\n      return null;\n    });\n    await player.dispose();\n  });\n\n  test('playback start acknowledgment rejects without play intent', () async {\n"""
+          if t.count(anchor) != 1:
+              raise SystemExit('Unexpected playback ack test anchor')
+          test.write_text(t.replace(anchor, new_test, 1))
+          PY
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Resolve language version
+        working-directory: just_audio
+        shell: bash
+        run: |
+          flutter pub get --no-example
+          git checkout -- analysis_options.yaml
+      - name: Format and exact scope gate
+        shell: bash
+        run: |
+          dart format just_audio/lib/just_audio.dart just_audio/test/just_audio_test.dart
+          git diff --check
+          actual="$(git diff --name-only | sort)"
+          expected="$(printf '%s\n' just_audio/lib/just_audio.dart just_audio/test/just_audio_test.dart | sort)"
+          [[ "$actual" == "$expected" ]] || { printf 'Unexpected changed paths:\n%s\n' "$actual" >&2; exit 1; }
+      - name: Analyze and run full just_audio test file
+        working-directory: just_audio
+        shell: bash
+        run: |
+          flutter analyze lib --no-fatal-warnings 2>&1 | tee /tmp/analyze.txt
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+          issues = [line for line in Path('/tmp/analyze.txt').read_text().splitlines() if re.match(r'^\s*(error|warning|info) •', line)]
+          if len(issues) != 1 or 'warning •' not in issues[0] or 'unawaited_return_in_try_block' not in issues[0]:
+              raise SystemExit(f'Unexpected analyzer issues: {issues}')
+          PY
+          flutter test test/just_audio_test.dart
+      - name: Restore side effects and revalidate scope
+        shell: bash
+        run: |
+          git checkout -- just_audio/analysis_options.yaml
+          rm -rf just_audio/.dart_tool
+          rm -f just_audio/pubspec.lock
+          git diff --check
+          actual="$(git diff --name-only | sort)"
+          expected="$(printf '%s\n' just_audio/lib/just_audio.dart just_audio/test/just_audio_test.dart | sort)"
+          [[ "$actual" == "$expected" ]] || { printf 'Unexpected changed paths after validation:\n%s\n' "$actual" >&2; exit 1; }
+      - name: Commit validated fail-closed hardening
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add just_audio/lib/just_audio.dart just_audio/test/just_audio_test.dart
+          git commit -m 'fix: fail closed before native play dispatch'
+      - name: Push only if target is unchanged
+        shell: bash
+        run: |
+          expected='c6efa2e1415155a6aad515c7f255602b785883c2'
+          remote_head="$(git ls-remote origin refs/heads/feat/backend-playback-ack | cut -f1)"
+          [[ "$remote_head" == "$expected" ]] || { echo "Target moved externally: $remote_head" >&2; exit 1; }
+          [[ "$(git rev-parse HEAD^)" == "$expected" ]] || { echo 'Unexpected parent' >&2; exit 1; }
+          [[ -z "$(git status --porcelain)" ]] || { git status --short >&2; exit 1; }
+          git push origin HEAD:refs/heads/feat/backend-playback-ack
