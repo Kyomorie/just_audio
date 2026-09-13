@@ -1,0 +1,274 @@
+name: P1 backend playback acknowledgment apply
+
+on:
+  push:
+    branches:
+      - automation/p1-just-audio-apply
+    paths:
+      - .github/workflows/p1-backend-playback-ack-apply.yml
+
+permissions: {}
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout exact target branch
+        uses: actions/checkout@v6
+        with:
+          ref: feat/backend-playback-ack
+          fetch-depth: 2
+
+      - name: Verify exact target head
+        shell: bash
+        run: |
+          expected='a7db3a1a939c2182239d44d0fe52ef54364f103d'
+          actual="$(git rev-parse HEAD)"
+          if [[ "$actual" != "$expected" ]]; then
+            echo "Unexpected target head: $actual" >&2
+            exit 1
+          fi
+
+      - name: Apply backend playback acknowledgment contract
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              text = p.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'{path}: expected exactly one match, found {count}: {old[:120]!r}')
+              p.write_text(text.replace(old, new, 1))
+
+          interface = 'just_audio_platform_interface/lib/just_audio_platform_interface.dart'
+          replace_once(
+              interface,
+              '''  /// Pauses playback.\n  Future<PauseResponse> pause(PauseRequest request) {\n''',
+              '''  /// Waits until the backend confirms that the current source is\n  /// effectively playing. Platform implementations that do not provide this\n  /// stronger signal return [PlaybackStartStatusMessage.unsupported].\n  Future<AwaitPlaybackStartResponse> awaitPlaybackStart(\n      AwaitPlaybackStartRequest request) {\n    return Future.value(AwaitPlaybackStartResponse(\n      status: PlaybackStartStatusMessage.unsupported,\n    ));\n  }\n\n  /// Pauses playback.\n  Future<PauseResponse> pause(PauseRequest request) {\n''')
+          replace_once(
+              interface,
+              '''class PlayerDataMessage {\n  final bool? playing;\n  final double? volume;\n''',
+              '''class PlayerDataMessage {\n  final bool? playing;\n  final bool? effectivePlaying;\n  final double? volume;\n''')
+          replace_once(
+              interface,
+              '''  PlayerDataMessage({\n    this.playing,\n    this.volume,\n''',
+              '''  PlayerDataMessage({\n    this.playing,\n    this.effectivePlaying,\n    this.volume,\n''')
+          replace_once(
+              interface,
+              '''      PlayerDataMessage(\n        playing: map['playing'] as bool?,\n        volume: map['volume'] as double?,\n''',
+              '''      PlayerDataMessage(\n        playing: map['playing'] as bool?,\n        effectivePlaying: map['effectivePlaying'] as bool?,\n        volume: map['volume'] as double?,\n''')
+          replace_once(
+              interface,
+              '''class PlayResponse {\n  static PlayResponse fromMap(Map<dynamic, dynamic> map) => PlayResponse();\n}\n\n/// Information communicated to the platform implementation when pausing\n''',
+              '''class PlayResponse {\n  static PlayResponse fromMap(Map<dynamic, dynamic> map) => PlayResponse();\n}\n\n/// Backend-confirmed playback-start state.\nenum PlaybackStartStatusMessage {\n  started,\n  superseded,\n  rejected,\n  failed,\n  unsupported,\n}\n\n/// Information communicated when waiting for backend-confirmed playback.\nclass AwaitPlaybackStartRequest {\n  final String attemptId;\n\n  AwaitPlaybackStartRequest({required this.attemptId});\n\n  Map<dynamic, dynamic> toMap() => <dynamic, dynamic>{\n        'attemptId': attemptId,\n      };\n}\n\n/// Information returned after waiting for backend-confirmed playback.\nclass AwaitPlaybackStartResponse {\n  final PlaybackStartStatusMessage status;\n  final String? errorMessage;\n\n  AwaitPlaybackStartResponse({\n    required this.status,\n    this.errorMessage,\n  });\n\n  static AwaitPlaybackStartResponse fromMap(Map<dynamic, dynamic> map) {\n    final rawStatus = map['status'] as String?;\n    final status = PlaybackStartStatusMessage.values.firstWhere(\n      (value) => value.name == rawStatus,\n      orElse: () => PlaybackStartStatusMessage.failed,\n    );\n    return AwaitPlaybackStartResponse(\n      status: status,\n      errorMessage: map['errorMessage'] as String?,\n    );\n  }\n}\n\n/// Information communicated to the platform implementation when pausing\n''')
+
+          method_channel = 'just_audio_platform_interface/lib/method_channel_just_audio.dart'
+          replace_once(
+              method_channel,
+              '''  @override\n  Future<PauseResponse> pause(PauseRequest request) async {\n''',
+              '''  @override\n  Future<AwaitPlaybackStartResponse> awaitPlaybackStart(\n      AwaitPlaybackStartRequest request) async {\n    return AwaitPlaybackStartResponse.fromMap(\n        (await _channel.invokeMethod<Map<dynamic, dynamic>>(\n            'awaitPlaybackStart', request.toMap()))!);\n  }\n\n  @override\n  Future<PauseResponse> pause(PauseRequest request) async {\n''')
+
+          dart = 'just_audio/lib/just_audio.dart'
+          replace_once(
+              dart,
+              '''/// An audio player that plays a gapless playlist of [AudioSource]s.\n''',
+              '''/// Result of waiting for backend-confirmed effective playback.\nenum PlaybackStartStatus {\n  started,\n  superseded,\n  rejected,\n  failed,\n  unsupported,\n}\n\n/// A backend-confirmed playback-start result.\nclass PlaybackStartResult {\n  final PlaybackStartStatus status;\n  final String? errorMessage;\n\n  const PlaybackStartResult(this.status, {this.errorMessage});\n\n  bool get started => status == PlaybackStartStatus.started;\n\n  factory PlaybackStartResult._fromMessage(\n      AwaitPlaybackStartResponse response) {\n    return PlaybackStartResult(\n      PlaybackStartStatus.values[response.status.index],\n      errorMessage: response.errorMessage,\n    );\n  }\n}\n\n/// An audio player that plays a gapless playlist of [AudioSource]s.\n''')
+          replace_once(
+              dart,
+              '''  final _playingSubject = BehaviorSubject.seeded(false);\n  final _volumeSubject = BehaviorSubject.seeded(1.0);\n''',
+              '''  final _playingSubject = BehaviorSubject.seeded(false);\n  final _effectivePlayingSubject = BehaviorSubject.seeded(false);\n  final _volumeSubject = BehaviorSubject.seeded(1.0);\n''')
+          replace_once(
+              dart,
+              '''        if (message.playing != null && message.playing != playing) {\n          _playerEventSubject\n              .add(playerEvent.copyWith(playing: message.playing!));\n        }\n        if (message.volume != null) {\n''',
+              '''        if (message.playing != null && message.playing != playing) {\n          _playerEventSubject\n              .add(playerEvent.copyWith(playing: message.playing!));\n        }\n        if (message.effectivePlaying != null &&\n            message.effectivePlaying != effectivePlaying) {\n          _effectivePlayingSubject.add(message.effectivePlaying!);\n        }\n        if (message.volume != null) {\n''')
+          replace_once(
+              dart,
+              '''  /// The current volume of the player.\n  double get volume => _volumeSubject.nvalue!;\n''',
+              '''  /// Whether the backend is currently rendering the active source.\n  ///\n  /// Unlike [playing], this is not playback intent. It is confirmed by the\n  /// backend and becomes false while playback is not effectively running.\n  bool get effectivePlaying => _effectivePlayingSubject.nvalue!;\n\n  /// A stream of backend-confirmed effective playback changes.\n  Stream<bool> get effectivePlayingStream =>\n      _effectivePlayingSubject.stream.distinct();\n\n  /// The current volume of the player.\n  double get volume => _volumeSubject.nvalue!;\n''')
+          replace_once(
+              dart,
+              '''  Future<void> _sendPlayRequest(\n      AudioPlayerPlatform platform, Completer<void>? playCompleter) async {\n''',
+              '''  /// Waits for the native backend to confirm effective playback for\n  /// the currently loaded source. This does not infer success from [playing],\n  /// audio-session activation, elapsed time, or position movement.\n  Future<PlaybackStartResult> waitForPlaybackStart() async {\n    if (_disposed) {\n      return const PlaybackStartResult(\n        PlaybackStartStatus.failed,\n        errorMessage: 'Player disposed',\n      );\n    }\n    if (!playing) {\n      return const PlaybackStartResult(PlaybackStartStatus.rejected);\n    }\n\n    try {\n      final activation = _setPlatformActive(true);\n      if (activation != null) {\n        await activation;\n      }\n      if (_disposed) {\n        return const PlaybackStartResult(\n          PlaybackStartStatus.failed,\n          errorMessage: 'Player disposed',\n        );\n      }\n      if (!playing) {\n        return const PlaybackStartResult(PlaybackStartStatus.superseded);\n      }\n      final platform = await _platform;\n      final response = await platform.awaitPlaybackStart(\n        AwaitPlaybackStartRequest(attemptId: _uuid.v4()),\n      );\n      return PlaybackStartResult._fromMessage(response);\n    } on PlayerInterruptedException catch (error) {\n      return PlaybackStartResult(\n        PlaybackStartStatus.superseded,\n        errorMessage: error.message,\n      );\n    } catch (error) {\n      return PlaybackStartResult(\n        PlaybackStartStatus.failed,\n        errorMessage: error.toString(),\n      );\n    }\n  }\n\n  Future<void> _sendPlayRequest(\n      AudioPlayerPlatform platform, Completer<void>? playCompleter) async {\n''')
+          replace_once(
+              dart,
+              '''      await _playbackEventSubject.close();\n      await _sequenceStateSubject.close();\n      await _playingSubject.close();\n      await _volumeSubject.close();\n''',
+              '''      await _playbackEventSubject.close();\n      await _sequenceStateSubject.close();\n      await _playingSubject.close();\n      await _effectivePlayingSubject.close();\n      await _volumeSubject.close();\n''')
+          replace_once(
+              dart,
+              '''    _active = active;\n    final position = this.position;\n''',
+              '''    _active = active;\n    if (!active && effectivePlaying) {\n      _effectivePlayingSubject.add(false);\n    }\n    final position = this.position;\n''')
+
+          android = 'just_audio/android/src/main/java/com/ryanheise/just_audio/AudioPlayer.java'
+          replace_once(
+              android,
+              '''    private Map<String, Object> pendingPlaybackEvent;\n\n    private static class AudioEffectState {\n''',
+              '''    private Map<String, Object> pendingPlaybackEvent;\n    private long playbackSourceEpoch = 0L;\n    private long playbackControlEpoch = 0L;\n    private Result playbackStartResult;\n    private long playbackStartSourceEpoch;\n    private long playbackStartControlEpoch;\n    private Integer playbackStartIndex;\n    private String playbackStartAttemptId;\n    private boolean lastEffectivePlaying = false;\n\n    private static class AudioEffectState {\n''')
+          replace_once(
+              android,
+              '''            case "play":\n                play(result);\n                break;\n            case "pause":\n''',
+              '''            case "play":\n                play(result);\n                break;\n            case "awaitPlaybackStart":\n                awaitPlaybackStart(call.argument("attemptId"), result);\n                break;\n            case "pause":\n''')
+          replace_once(
+              android,
+              '''    private void load(final List<MediaSource> mediaSources, ShuffleOrder shuffleOrder, final long initialPosition, final Integer initialIndex, final Result result) {\n        currentIndex = initialIndex != null ? initialIndex : 0;\n''',
+              '''    private void load(final List<MediaSource> mediaSources, ShuffleOrder shuffleOrder, final long initialPosition, final Integer initialIndex, final Result result) {\n        advancePlaybackSourceEpoch();\n        currentIndex = initialIndex != null ? initialIndex : 0;\n''')
+          replace_once(
+              android,
+              '''    public void play(Result result) {\n''',
+              '''    private boolean isEffectivelyPlaying() {\n        return player != null\n            && processingState == ProcessingState.ready\n            && player.isPlaying();\n    }\n\n    private void broadcastEffectivePlayingIfChanged() {\n        final boolean effectivePlaying = isEffectivelyPlaying();\n        if (effectivePlaying == lastEffectivePlaying) return;\n        lastEffectivePlaying = effectivePlaying;\n        dataEventChannel.success(mapOf("effectivePlaying", effectivePlaying));\n    }\n\n    private void completePlaybackStart(String status, String errorMessage) {\n        if (playbackStartResult == null) return;\n        final Result result = playbackStartResult;\n        playbackStartResult = null;\n        playbackStartIndex = null;\n        playbackStartAttemptId = null;\n        result.success(mapOf(\n            "status", status,\n            "errorMessage", errorMessage\n        ));\n    }\n\n    private void advancePlaybackSourceEpoch() {\n        playbackSourceEpoch++;\n        playbackControlEpoch++;\n        completePlaybackStart("superseded", null);\n    }\n\n    private void advancePlaybackControlEpoch() {\n        playbackControlEpoch++;\n        completePlaybackStart("superseded", null);\n    }\n\n    private void evaluatePlaybackStart() {\n        broadcastEffectivePlayingIfChanged();\n        if (playbackStartResult == null) return;\n        final boolean indexChanged = playbackStartIndex == null\n            ? currentIndex != null\n            : !playbackStartIndex.equals(currentIndex);\n        if (playbackStartSourceEpoch != playbackSourceEpoch\n                || playbackStartControlEpoch != playbackControlEpoch\n                || indexChanged) {\n            completePlaybackStart("superseded", null);\n            return;\n        }\n        if (player == null\n                || player.getMediaItemCount() == 0\n                || !player.getPlayWhenReady()\n                || processingState == ProcessingState.idle\n                || processingState == ProcessingState.completed) {\n            completePlaybackStart("rejected", null);\n            return;\n        }\n        if (isEffectivelyPlaying()) {\n            completePlaybackStart("started", null);\n        }\n    }\n\n    private void awaitPlaybackStart(String attemptId, Result result) {\n        completePlaybackStart("superseded", null);\n        if (player == null\n                || player.getMediaItemCount() == 0\n                || !player.getPlayWhenReady()\n                || processingState == ProcessingState.idle\n                || processingState == ProcessingState.completed) {\n            result.success(mapOf("status", "rejected", "errorMessage", null));\n            return;\n        }\n        playbackStartResult = result;\n        playbackStartSourceEpoch = playbackSourceEpoch;\n        playbackStartControlEpoch = playbackControlEpoch;\n        playbackStartIndex = currentIndex;\n        playbackStartAttemptId = attemptId;\n        evaluatePlaybackStart();\n    }\n\n    @Override\n    public void onIsPlayingChanged(boolean isPlaying) {\n        evaluatePlaybackStart();\n    }\n\n    public void play(Result result) {\n''')
+          replace_once(
+              android,
+              '''    public void pause() {\n        if (!player.getPlayWhenReady()) return;\n        player.setPlayWhenReady(false);\n''',
+              '''    public void pause() {\n        advancePlaybackControlEpoch();\n        if (!player.getPlayWhenReady()) {\n            broadcastEffectivePlayingIfChanged();\n            return;\n        }\n        player.setPlayWhenReady(false);\n        broadcastEffectivePlayingIfChanged();\n''')
+          replace_once(
+              android,
+              '''    public void seek(final long position, final Integer index, final Result result) {\n        if (processingState == ProcessingState.idle || processingState == ProcessingState.loading) {\n''',
+              '''    public void seek(final long position, final Integer index, final Result result) {\n        advancePlaybackControlEpoch();\n        if (processingState == ProcessingState.idle || processingState == ProcessingState.loading) {\n''')
+          replace_once(
+              android,
+              '''    public void dispose() {\n        if (processingState == ProcessingState.loading) {\n''',
+              '''    public void dispose() {\n        advancePlaybackControlEpoch();\n        if (processingState == ProcessingState.loading) {\n''')
+          replace_once(
+              android,
+              '''    public void onPlayerError(PlaybackException error) {\n        if (error instanceof ExoPlaybackException) {\n''',
+              '''    public void onPlayerError(PlaybackException error) {\n        completePlaybackStart("failed", error.getMessage());\n        if (error instanceof ExoPlaybackException) {\n''')
+          replace_once(
+              android,
+              '''        case Player.STATE_ENDED:\n            if (processingState != ProcessingState.completed) {\n''',
+              '''        case Player.STATE_ENDED:\n            completePlaybackStart("rejected", "Playback completed before start acknowledgment");\n            if (processingState != ProcessingState.completed) {\n''')
+
+          darwin = 'just_audio/darwin/just_audio/Sources/just_audio/AudioPlayer.m'
+          replace_once(
+              darwin,
+              '''    FlutterResult _playResult;\n    id _timeObserver;\n''',
+              '''    FlutterResult _playResult;\n    FlutterResult _playbackStartResult;\n    long long _playbackSourceEpoch;\n    long long _playbackControlEpoch;\n    long long _playbackStartSourceEpoch;\n    long long _playbackStartControlEpoch;\n    int _playbackStartIndex;\n    NSString *_playbackStartAttemptId;\n    BOOL _lastEffectivePlaying;\n    id _timeObserver;\n''')
+          replace_once(
+              darwin,
+              '''    _playResult = nil;\n    _automaticallyWaitsToMinimizeStalling = YES;\n''',
+              '''    _playResult = nil;\n    _playbackStartResult = nil;\n    _playbackSourceEpoch = 0;\n    _playbackControlEpoch = 0;\n    _playbackStartSourceEpoch = 0;\n    _playbackStartControlEpoch = 0;\n    _playbackStartIndex = 0;\n    _playbackStartAttemptId = nil;\n    _lastEffectivePlaying = NO;\n    _automaticallyWaitsToMinimizeStalling = YES;\n''')
+          replace_once(
+              darwin,
+              '''        } else if ([@"play" isEqualToString:call.method]) {\n            [self play:result];\n        } else if ([@"pause" isEqualToString:call.method]) {\n''',
+              '''        } else if ([@"play" isEqualToString:call.method]) {\n            [self play:result];\n        } else if ([@"awaitPlaybackStart" isEqualToString:call.method]) {\n            [self awaitPlaybackStart:(NSString *)request[@"attemptId"] result:result];\n        } else if ([@"pause" isEqualToString:call.method]) {\n''')
+          replace_once(
+              darwin,
+              '''- (void)load:(NSDictionary *)source initialPosition:(CMTime)initialPosition initialIndex:(NSNumber *)initialIndex result:(FlutterResult)result {\n    if (_playing) {\n''',
+              '''- (void)load:(NSDictionary *)source initialPosition:(CMTime)initialPosition initialIndex:(NSNumber *)initialIndex result:(FlutterResult)result {\n    [self advancePlaybackSourceEpoch];\n    if (_playing) {\n''')
+          replace_once(
+              darwin,
+              '''- (void)play {\n''',
+              '''- (BOOL)isEffectivelyPlaying {\n    if (!_player || !_playing || _processingState != psReady) return NO;\n    if (@available(macOS 10.12, iOS 10.0, *)) {\n        return _player.timeControlStatus == AVPlayerTimeControlStatusPlaying;\n    }\n    return _player.rate != 0.0f;\n}\n\n- (void)broadcastEffectivePlayingIfChanged {\n    BOOL effectivePlaying = [self isEffectivelyPlaying];\n    if (effectivePlaying == _lastEffectivePlaying) return;\n    _lastEffectivePlaying = effectivePlaying;\n    [_dataEventChannel sendEvent:@{@"effectivePlaying": @(effectivePlaying)}];\n}\n\n- (void)completePlaybackStart:(NSString *)status errorMessage:(NSString *)errorMessage {\n    if (!_playbackStartResult) return;\n    FlutterResult result = _playbackStartResult;\n    _playbackStartResult = nil;\n    _playbackStartAttemptId = nil;\n    result(@{\n        @"status": status,\n        @"errorMessage": errorMessage ?: (id)[NSNull null],\n    });\n}\n\n- (void)advancePlaybackSourceEpoch {\n    _playbackSourceEpoch++;\n    _playbackControlEpoch++;\n    [self completePlaybackStart:@"superseded" errorMessage:nil];\n}\n\n- (void)advancePlaybackControlEpoch {\n    _playbackControlEpoch++;\n    [self completePlaybackStart:@"superseded" errorMessage:nil];\n}\n\n- (void)evaluatePlaybackStart {\n    [self broadcastEffectivePlayingIfChanged];\n    if (!_playbackStartResult) return;\n    if (_playbackStartSourceEpoch != _playbackSourceEpoch\n            || _playbackStartControlEpoch != _playbackControlEpoch\n            || _playbackStartIndex != _index) {\n        [self completePlaybackStart:@"superseded" errorMessage:nil];\n        return;\n    }\n    if (!_player || !_player.currentItem || !_playing\n            || _processingState == psIdle || _processingState == psCompleted) {\n        [self completePlaybackStart:@"rejected" errorMessage:nil];\n        return;\n    }\n    if ([self isEffectivelyPlaying]) {\n        [self completePlaybackStart:@"started" errorMessage:nil];\n    }\n}\n\n- (void)awaitPlaybackStart:(NSString *)attemptId result:(FlutterResult)result {\n    [self completePlaybackStart:@"superseded" errorMessage:nil];\n    if (!_player || !_player.currentItem || !_playing\n            || _processingState == psIdle || _processingState == psCompleted) {\n        result(@{@"status": @"rejected", @"errorMessage": (id)[NSNull null]});\n        return;\n    }\n    _playbackStartResult = result;\n    _playbackStartSourceEpoch = _playbackSourceEpoch;\n    _playbackStartControlEpoch = _playbackControlEpoch;\n    _playbackStartIndex = _index;\n    _playbackStartAttemptId = attemptId;\n    [self evaluatePlaybackStart];\n}\n\n- (void)play {\n''')
+          replace_once(
+              darwin,
+              '''- (void)pause {\n    if (!_playing) return;\n    _playing = NO;\n    [_player pause];\n''',
+              '''- (void)pause {\n    [self advancePlaybackControlEpoch];\n    if (!_playing) {\n        [self broadcastEffectivePlayingIfChanged];\n        return;\n    }\n    _playing = NO;\n    [_player pause];\n    [self broadcastEffectivePlayingIfChanged];\n''')
+          replace_once(
+              darwin,
+              '''- (void)seek:(CMTime)position index:(NSNumber *)newIndex completionHandler:(void (^)(BOOL))completionHandler {\n    if (_processingState == psIdle || _processingState == psLoading) {\n''',
+              '''- (void)seek:(CMTime)position index:(NSNumber *)newIndex completionHandler:(void (^)(BOOL))completionHandler {\n    [self advancePlaybackControlEpoch];\n    if (_processingState == psIdle || _processingState == psLoading) {\n''')
+          replace_once(
+              darwin,
+              '''            switch (status) {\n                case AVPlayerTimeControlStatusPaused:\n                    //NSLog(@"AVPlayerTimeControlStatusPaused");\n                    break;\n                case AVPlayerTimeControlStatusWaitingToPlayAtSpecifiedRate:\n                    //NSLog(@"AVPlayerTimeControlStatusWaitingToPlayAtSpecifiedRate");\n                    if (_processingState != psCompleted) {\n                        [self enterBuffering:@"timeControlStatus"];\n                        [self updatePosition];\n                        [self broadcastPlaybackEvent];\n                    } else {\n                        //NSLog(@"Ignoring wait signal because we reached the end");\n                    }\n                    break;\n                case AVPlayerTimeControlStatusPlaying:\n                    [self leaveBuffering:@"timeControlStatus"];\n                    [self updatePosition];\n                    [self broadcastPlaybackEvent];\n                    break;\n            }\n''',
+              '''            switch (status) {\n                case AVPlayerTimeControlStatusPaused:\n                    //NSLog(@"AVPlayerTimeControlStatusPaused");\n                    break;\n                case AVPlayerTimeControlStatusWaitingToPlayAtSpecifiedRate:\n                    //NSLog(@"AVPlayerTimeControlStatusWaitingToPlayAtSpecifiedRate");\n                    if (_processingState != psCompleted) {\n                        [self enterBuffering:@"timeControlStatus"];\n                        [self updatePosition];\n                        [self broadcastPlaybackEvent];\n                    } else {\n                        //NSLog(@"Ignoring wait signal because we reached the end");\n                    }\n                    break;\n                case AVPlayerTimeControlStatusPlaying:\n                    [self leaveBuffering:@"timeControlStatus"];\n                    [self updatePosition];\n                    [self broadcastPlaybackEvent];\n                    break;\n            }\n            [self evaluatePlaybackStart];\n''')
+          replace_once(
+              darwin,
+              '''            if (_index != expectedIndex) {\n                // AVQueuePlayer will sometimes skip over error items without\n''',
+              '''            if (_index != expectedIndex) {\n                // AVQueuePlayer will sometimes skip over error items without\n''')
+          replace_once(
+              darwin,
+              '''                [self broadcastPlaybackEvent];\n            }\n        }\n        //NSLog(@"currentItem changed. _index=%d", _index);\n''',
+              '''                [self broadcastPlaybackEvent];\n            }\n            [self evaluatePlaybackStart];\n        }\n        //NSLog(@"currentItem changed. _index=%d", _index);\n''')
+          replace_once(
+              darwin,
+              '''- (void)sendError:(NSNumber *)errorCode errorMessage:(NSString *)errorMessage playerItem:(IndexedPlayerItem *)playerItem switchToIdle:(BOOL)switchToIdle {\n    //NSLog(@"sendError (%@) %@", errorCode, errorMessage);\n''',
+              '''- (void)sendError:(NSNumber *)errorCode errorMessage:(NSString *)errorMessage playerItem:(IndexedPlayerItem *)playerItem switchToIdle:(BOOL)switchToIdle {\n    [self completePlaybackStart:@"failed" errorMessage:errorMessage];\n    //NSLog(@"sendError (%@) %@", errorCode, errorMessage);\n''')
+          replace_once(
+              darwin,
+              '''- (void)dispose:(BOOL)calledFromDealloc {\n    if (!_player) return;\n''',
+              '''- (void)dispose:(BOOL)calledFromDealloc {\n    [self advancePlaybackControlEpoch];\n    if (!_player) return;\n''')
+          PY
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Format Dart sources
+        shell: bash
+        run: |
+          dart format \
+            just_audio_platform_interface/lib/just_audio_platform_interface.dart \
+            just_audio_platform_interface/lib/method_channel_just_audio.dart \
+            just_audio/lib/just_audio.dart
+          git diff --check
+
+      - name: Validate changed paths
+        shell: bash
+        run: |
+          actual="$(git diff --name-only | sort)"
+          expected="$(printf '%s\n' \
+            just_audio/android/src/main/java/com/ryanheise/just_audio/AudioPlayer.java \
+            just_audio/darwin/just_audio/Sources/just_audio/AudioPlayer.m \
+            just_audio/lib/just_audio.dart \
+            just_audio_platform_interface/lib/just_audio_platform_interface.dart \
+            just_audio_platform_interface/lib/method_channel_just_audio.dart | sort)"
+          if [[ "$actual" != "$expected" ]]; then
+            echo 'Unexpected changed paths:' >&2
+            printf '%s\n' "$actual" >&2
+            exit 1
+          fi
+
+      - name: Analyze platform interface
+        shell: bash
+        working-directory: just_audio_platform_interface
+        run: |
+          flutter pub get
+          flutter analyze
+          flutter test
+
+      - name: Analyze just_audio
+        shell: bash
+        working-directory: just_audio
+        run: |
+          flutter pub get
+          flutter analyze lib
+          flutter test
+
+      - name: Commit validated source
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add \
+            just_audio/android/src/main/java/com/ryanheise/just_audio/AudioPlayer.java \
+            just_audio/darwin/just_audio/Sources/just_audio/AudioPlayer.m \
+            just_audio/lib/just_audio.dart \
+            just_audio_platform_interface/lib/just_audio_platform_interface.dart \
+            just_audio_platform_interface/lib/method_channel_just_audio.dart
+          git commit -m 'feat: add backend playback start acknowledgment'
+
+      - name: Push only if target branch is unchanged
+        shell: bash
+        run: |
+          expected='a7db3a1a939c2182239d44d0fe52ef54364f103d'
+          remote_head="$(git ls-remote origin refs/heads/feat/backend-playback-ack | cut -f1)"
+          if [[ "$remote_head" != "$expected" ]]; then
+            echo "Target branch moved externally: $remote_head" >&2
+            exit 1
+          fi
+          if [[ "$(git rev-parse HEAD^)" != "$expected" ]]; then
+            echo 'Validated source commit has unexpected parent.' >&2
+            exit 1
+          fi
+          if [[ -n "$(git status --porcelain)" ]]; then
+            echo 'Working tree is dirty after validation.' >&2
+            git status --short >&2
+            exit 1
+          fi
+          git push origin HEAD:refs/heads/feat/backend-playback-ack
