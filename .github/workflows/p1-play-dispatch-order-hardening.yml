@@ -1,0 +1,206 @@
+name: P1 play dispatch ordering hardening
+
+on:
+  push:
+    branches:
+      - automation/p1-just-audio-apply
+    paths:
+      - .github/workflows/p1-play-dispatch-order-hardening.yml
+
+permissions: {}
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout exact target branch
+        uses: actions/checkout@v6
+        with:
+          ref: feat/backend-playback-ack
+          fetch-depth: 2
+
+      - name: Verify exact target head
+        shell: bash
+        run: |
+          expected='16de0252e42b3badc817fbc2e18d03d6feea2b7f'
+          actual="$(git rev-parse HEAD)"
+          if [[ "$actual" != "$expected" ]]; then
+            echo "Unexpected target head: $actual" >&2
+            exit 1
+          fi
+
+      - name: Apply asserted lifecycle fix and regression coverage
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          source = Path('just_audio/lib/just_audio.dart')
+          text = source.read_text()
+
+          field_anchor = "  final bool _handleAudioSessionActivation;\n"
+          field_insert = """  final bool _handleAudioSessionActivation;\n  int _playRequestGeneration = 0;\n  Completer<void>? _playRequestDispatchCompleter;\n"""
+          if text.count(field_anchor) != 1:
+              raise SystemExit('Unexpected play lifecycle field anchor')
+          text = text.replace(field_anchor, field_insert, 1)
+
+          old_play = """  Future<void> play() async {\n    if (_disposed) return;\n    if (playing) return;\n    _playInterrupted = false;\n    // Broadcast to clients immediately, but revert to false if we fail to\n    // activate the audio session. This allows setAudioSource to be aware of a\n    // prior play request.\n    _playerEventSubject.add(PlayerEvent(\n      playing: true,\n      playbackEvent: playbackEvent.copyWith(\n        updatePosition: position,\n        updateTime: DateTime.now(),\n      ),\n    ));\n    final playCompleter = Completer<dynamic>();\n    final audioSession = await AudioSession.instance;\n    if (!_handleAudioSessionActivation || await audioSession.setActive(true)) {\n      if (!playing) return;\n      // TODO: rewrite this to more cleanly handle simultaneous load/play\n      // requests which each may result in platform play requests.\n      final requireActive = _playlist.children.isNotEmpty;\n      if (requireActive) {\n        if (_active) {\n          // If the native platform is already active, send it a play request.\n          // NOTE: If a load() request happens simultaneously, this may result\n          // in two play requests being sent. The platform implementation should\n          // ignore the second play request since it is already playing.\n          _sendPlayRequest(await _platform, playCompleter);\n        } else {\n          // If the native platform wasn't already active, activating it will\n          // implicitly restore the playing state and send a play request.\n          _setPlatformActive(true, playCompleter: playCompleter)\n              ?.catchError((dynamic e) async => null);\n        }\n      }\n    } else {\n      // Revert if we fail to activate the audio session.\n      _playerEventSubject.add(playerEvent.copyWith(playing: false));\n    }\n    await playCompleter.future;\n  }\n"""
+          new_play = """  void _completePlayRequestDispatch(Completer<void>? completer) {\n    if (completer != null && !completer.isCompleted) {\n      completer.complete();\n    }\n    if (identical(_playRequestDispatchCompleter, completer)) {\n      _playRequestDispatchCompleter = null;\n    }\n  }\n\n  Future<void> play() async {\n    if (_disposed) return;\n    if (playing) return;\n    _playInterrupted = false;\n    final playRequestDispatchCompleter = Completer<void>();\n    _playRequestGeneration++;\n    _playRequestDispatchCompleter = playRequestDispatchCompleter;\n    // Broadcast to clients immediately, but revert to false if we fail to\n    // activate the audio session. This allows setAudioSource to be aware of a\n    // prior play request.\n    _playerEventSubject.add(PlayerEvent(\n      playing: true,\n      playbackEvent: playbackEvent.copyWith(\n        updatePosition: position,\n        updateTime: DateTime.now(),\n      ),\n    ));\n    final playCompleter = Completer<dynamic>();\n    try {\n      final audioSession = await AudioSession.instance;\n      if (!_handleAudioSessionActivation || await audioSession.setActive(true)) {\n        if (!playing) {\n          _completePlayRequestDispatch(playRequestDispatchCompleter);\n          return;\n        }\n        // TODO: rewrite this to more cleanly handle simultaneous load/play\n        // requests which each may result in platform play requests.\n        final requireActive = _playlist.children.isNotEmpty;\n        if (requireActive) {\n          if (_active) {\n            // If the native platform is already active, send it a play request.\n            // NOTE: If a load() request happens simultaneously, this may result\n            // in two play requests being sent. The platform implementation should\n            // ignore the second play request since it is already playing.\n            _sendPlayRequest(\n              await _platform,\n              playCompleter,\n              playRequestDispatchCompleter: playRequestDispatchCompleter,\n            );\n          } else {\n            // If the native platform wasn't already active, activating it will\n            // implicitly restore the playing state and send a play request.\n            final activation = _setPlatformActive(\n              true,\n              playCompleter: playCompleter,\n              playRequestDispatchCompleter: playRequestDispatchCompleter,\n            );\n            if (activation != null) {\n              unawaited(activation.whenComplete(() {\n                _completePlayRequestDispatch(playRequestDispatchCompleter);\n              }).catchError((dynamic e) async => null));\n            } else {\n              _completePlayRequestDispatch(playRequestDispatchCompleter);\n            }\n          }\n        } else {\n          _completePlayRequestDispatch(playRequestDispatchCompleter);\n        }\n      } else {\n        // Revert if we fail to activate the audio session.\n        _playerEventSubject.add(playerEvent.copyWith(playing: false));\n        _completePlayRequestDispatch(playRequestDispatchCompleter);\n      }\n    } catch (_) {\n      _completePlayRequestDispatch(playRequestDispatchCompleter);\n      rethrow;\n    }\n    await playCompleter.future;\n  }\n"""
+          if text.count(old_play) != 1:
+              raise SystemExit('Unexpected play() implementation')
+          text = text.replace(old_play, new_play, 1)
+
+          old_pause = """  Future<void> pause() async {\n    if (_disposed) return;\n    if (!playing) return;\n    final stopwatch = Stopwatch();\n"""
+          new_pause = """  Future<void> pause() async {\n    if (_disposed) return;\n    if (!playing) return;\n    _playRequestGeneration++;\n    _completePlayRequestDispatch(_playRequestDispatchCompleter);\n    final stopwatch = Stopwatch();\n"""
+          if text.count(old_pause) != 1:
+              raise SystemExit('Unexpected pause() implementation')
+          text = text.replace(old_pause, new_pause, 1)
+
+          old_wait = """  Future<PlaybackStartResult> waitForPlaybackStart() async {\n    if (_disposed) {\n      return const PlaybackStartResult(\n        PlaybackStartStatus.failed,\n        errorMessage: 'Player disposed',\n      );\n    }\n    if (!playing) {\n      return const PlaybackStartResult(PlaybackStartStatus.rejected);\n    }\n\n    try {\n      final activation = _setPlatformActive(true);\n      if (activation != null) {\n        await activation;\n      }\n      if (_disposed) {\n        return const PlaybackStartResult(\n          PlaybackStartStatus.failed,\n          errorMessage: 'Player disposed',\n        );\n      }\n      if (!playing) {\n        return const PlaybackStartResult(PlaybackStartStatus.superseded);\n      }\n      final platform = await _platform;\n      final response = await platform.awaitPlaybackStart(\n        AwaitPlaybackStartRequest(attemptId: _uuid.v4()),\n      );\n      return PlaybackStartResult._fromMessage(response);\n    } on PlayerInterruptedException catch (error) {\n      return PlaybackStartResult(\n        PlaybackStartStatus.superseded,\n        errorMessage: error.message,\n      );\n    } catch (error) {\n      return PlaybackStartResult(\n        PlaybackStartStatus.failed,\n        errorMessage: error.toString(),\n      );\n    }\n  }\n"""
+          new_wait = """  Future<PlaybackStartResult> waitForPlaybackStart() async {\n    if (_disposed) {\n      return const PlaybackStartResult(\n        PlaybackStartStatus.failed,\n        errorMessage: 'Player disposed',\n      );\n    }\n    if (!playing) {\n      return const PlaybackStartResult(PlaybackStartStatus.rejected);\n    }\n\n    final playRequestGeneration = _playRequestGeneration;\n    final playRequestDispatchCompleter = _playRequestDispatchCompleter;\n    if (playRequestDispatchCompleter != null &&\n        !playRequestDispatchCompleter.isCompleted) {\n      await playRequestDispatchCompleter.future;\n    }\n    if (_disposed) {\n      return const PlaybackStartResult(\n        PlaybackStartStatus.failed,\n        errorMessage: 'Player disposed',\n      );\n    }\n    if (_playRequestGeneration != playRequestGeneration || !playing) {\n      return const PlaybackStartResult(PlaybackStartStatus.superseded);\n    }\n\n    try {\n      final activation = _setPlatformActive(true);\n      if (activation != null) {\n        await activation;\n      }\n      if (processingState == ProcessingState.loading) {\n        await Future.any<void>([\n          processingStateStream\n              .firstWhere((state) => state != ProcessingState.loading),\n          playingStream.firstWhere((isPlaying) => !isPlaying),\n        ]);\n      }\n      if (_disposed) {\n        return const PlaybackStartResult(\n          PlaybackStartStatus.failed,\n          errorMessage: 'Player disposed',\n        );\n      }\n      if (_playRequestGeneration != playRequestGeneration || !playing) {\n        return const PlaybackStartResult(PlaybackStartStatus.superseded);\n      }\n      final platform = await _platform;\n      final response = await platform.awaitPlaybackStart(\n        AwaitPlaybackStartRequest(attemptId: _uuid.v4()),\n      );\n      return PlaybackStartResult._fromMessage(response);\n    } on PlayerInterruptedException catch (error) {\n      return PlaybackStartResult(\n        PlaybackStartStatus.superseded,\n        errorMessage: error.message,\n      );\n    } catch (error) {\n      return PlaybackStartResult(\n        PlaybackStartStatus.failed,\n        errorMessage: error.toString(),\n      );\n    }\n  }\n"""
+          if text.count(old_wait) != 1:
+              raise SystemExit('Unexpected waitForPlaybackStart() implementation')
+          text = text.replace(old_wait, new_wait, 1)
+
+          old_send = """  Future<void> _sendPlayRequest(\n      AudioPlayerPlatform platform, Completer<void>? playCompleter) async {\n    try {\n      if (!playing) return; // defensive\n      await platform.play(PlayRequest());\n      playCompleter?.complete();\n    } catch (e, stackTrace) {\n      playCompleter?.completeError(e, stackTrace);\n    }\n  }\n"""
+          new_send = """  Future<void> _sendPlayRequest(\n    AudioPlayerPlatform platform,\n    Completer<void>? playCompleter, {\n    Completer<void>? playRequestDispatchCompleter,\n  }) async {\n    try {\n      if (!playing) {\n        _completePlayRequestDispatch(playRequestDispatchCompleter);\n        return;\n      }\n      _completePlayRequestDispatch(playRequestDispatchCompleter);\n      await platform.play(PlayRequest());\n      playCompleter?.complete();\n    } catch (e, stackTrace) {\n      playCompleter?.completeError(e, stackTrace);\n    }\n  }\n"""
+          if text.count(old_send) != 1:
+              raise SystemExit('Unexpected _sendPlayRequest() implementation')
+          text = text.replace(old_send, new_send, 1)
+
+          old_stop = """  Future<void> stop() async {\n    if (_disposed) return;\n    final future =\n"""
+          new_stop = """  Future<void> stop() async {\n    if (_disposed) return;\n    _playRequestGeneration++;\n    _completePlayRequestDispatch(_playRequestDispatchCompleter);\n    final future =\n"""
+          if text.count(old_stop) != 1:
+              raise SystemExit('Unexpected stop() implementation')
+          text = text.replace(old_stop, new_stop, 1)
+
+          old_signature = """  Future<Duration?>? _setPlatformActive(bool active,\n      {Completer<void>? playCompleter, bool force = false}) {\n"""
+          new_signature = """  Future<Duration?>? _setPlatformActive(\n    bool active, {\n    Completer<void>? playCompleter,\n    Completer<void>? playRequestDispatchCompleter,\n    bool force = false,\n  }) {\n"""
+          if text.count(old_signature) != 1:
+              raise SystemExit('Unexpected _setPlatformActive() signature')
+          text = text.replace(old_signature, new_signature, 1)
+
+          old_restore_play = """        if (playing) {\n          _sendPlayRequest(platform, playCompleter);\n        }\n"""
+          new_restore_play = """        if (playing) {\n          _sendPlayRequest(\n            platform,\n            playCompleter,\n            playRequestDispatchCompleter: playRequestDispatchCompleter,\n          );\n        }\n"""
+          if text.count(old_restore_play) != 1:
+              raise SystemExit('Unexpected platform restore play call')
+          text = text.replace(old_restore_play, new_restore_play, 1)
+          source.write_text(text)
+
+          test = Path('just_audio/test/just_audio_test.dart')
+          text = test.read_text()
+          field_anchor = """  int awaitPlaybackStartCallCount = 0;\n  String? lastPlaybackStartAttemptId;\n"""
+          field_insert = """  int awaitPlaybackStartCallCount = 0;\n  String? lastPlaybackStartAttemptId;\n  int playCallCount = 0;\n"""
+          if text.count(field_anchor) != 1:
+              raise SystemExit('Unexpected mock playback-start fields')
+          text = text.replace(field_anchor, field_insert, 1)
+
+          old_mock_play = """  Future<PlayResponse> play(PlayRequest request) async {\n    if (_playing) return PlayResponse();\n"""
+          new_mock_play = """  Future<PlayResponse> play(PlayRequest request) async {\n    playCallCount++;\n    if (_playing) return PlayResponse();\n"""
+          if text.count(old_mock_play) != 1:
+              raise SystemExit('Unexpected mock play() implementation')
+          text = text.replace(old_mock_play, new_mock_play, 1)
+
+          old_ack = """    return AwaitPlaybackStartResponse(\n      status: playbackStartStatus,\n      errorMessage: playbackStartErrorMessage,\n    );\n"""
+          new_ack = """    return AwaitPlaybackStartResponse(\n      status: playCallCount == 0\n          ? PlaybackStartStatusMessage.rejected\n          : playbackStartStatus,\n      errorMessage: playbackStartErrorMessage,\n    );\n"""
+          if text.count(old_ack) != 1:
+              raise SystemExit('Unexpected mock playback-start response')
+          text = text.replace(old_ack, new_ack, 1)
+
+          assertion_anchor = """    expect(platform.awaitPlaybackStartCallCount, 1);\n    expect(platform.lastPlaybackStartAttemptId, isNotEmpty);\n"""
+          assertion_insert = """    expect(platform.playCallCount, greaterThanOrEqualTo(1));\n    expect(platform.awaitPlaybackStartCallCount, 1);\n    expect(platform.lastPlaybackStartAttemptId, isNotEmpty);\n"""
+          if text.count(assertion_anchor) != 1:
+              raise SystemExit('Unexpected playback-start assertion anchor')
+          text = text.replace(assertion_anchor, assertion_insert, 1)
+          test.write_text(text)
+          PY
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Resolve package language version
+        working-directory: just_audio
+        shell: bash
+        run: |
+          flutter pub get --no-example
+          git checkout -- analysis_options.yaml
+
+      - name: Format and scope gate
+        shell: bash
+        run: |
+          dart format just_audio/lib/just_audio.dart just_audio/test/just_audio_test.dart
+          git diff --check
+          actual="$(git diff --name-only | sort)"
+          expected="$(printf '%s\n' just_audio/lib/just_audio.dart just_audio/test/just_audio_test.dart | sort)"
+          if [[ "$actual" != "$expected" ]]; then
+            echo 'Unexpected changed paths:' >&2
+            printf '%s\n' "$actual" >&2
+            exit 1
+          fi
+
+      - name: Analyze and test just_audio
+        working-directory: just_audio
+        shell: bash
+        run: |
+          flutter analyze lib --no-fatal-warnings 2>&1 | tee /tmp/just_audio_analyze.txt
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+          text = Path('/tmp/just_audio_analyze.txt').read_text()
+          issues = [line for line in text.splitlines() if re.match(r'^\s*(error|warning|info) •', line)]
+          if len(issues) != 1:
+              raise SystemExit(f'Expected exactly one known baseline analyzer issue, found {len(issues)}: {issues}')
+          issue = issues[0]
+          if 'warning •' not in issue or 'unawaited_return_in_try_block' not in issue:
+              raise SystemExit(f'Unexpected analyzer issue: {issue}')
+          PY
+          flutter test test/just_audio_test.dart
+
+      - name: Restore toolchain side effects and revalidate scope
+        shell: bash
+        run: |
+          git checkout -- just_audio/analysis_options.yaml
+          rm -rf just_audio/.dart_tool
+          rm -f just_audio/pubspec.lock
+          git diff --check
+          actual="$(git diff --name-only | sort)"
+          expected="$(printf '%s\n' just_audio/lib/just_audio.dart just_audio/test/just_audio_test.dart | sort)"
+          if [[ "$actual" != "$expected" ]]; then
+            echo 'Unexpected changed paths after validation:' >&2
+            printf '%s\n' "$actual" >&2
+            exit 1
+          fi
+
+      - name: Commit validated lifecycle fix
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add just_audio/lib/just_audio.dart just_audio/test/just_audio_test.dart
+          git commit -m 'fix: order playback acknowledgment after play dispatch'
+
+      - name: Push only if target branch is unchanged
+        shell: bash
+        run: |
+          expected='16de0252e42b3badc817fbc2e18d03d6feea2b7f'
+          remote_head="$(git ls-remote origin refs/heads/feat/backend-playback-ack | cut -f1)"
+          if [[ "$remote_head" != "$expected" ]]; then
+            echo "Target branch moved externally: $remote_head" >&2
+            exit 1
+          fi
+          if [[ "$(git rev-parse HEAD^)" != "$expected" ]]; then
+            echo 'Validated commit has unexpected parent.' >&2
+            exit 1
+          fi
+          if [[ -n "$(git status --porcelain)" ]]; then
+            echo 'Working tree is dirty after validation.' >&2
+            git status --short >&2
+            exit 1
+          fi
+          git push origin HEAD:refs/heads/feat/backend-playback-ack
