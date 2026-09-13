@@ -1,0 +1,121 @@
+name: P2 final native smoke
+
+on:
+  push:
+    branches:
+      - automation/p2-confirmed-seek
+    paths:
+      - '.github/workflows/p2-final-native-smoke.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: automation/p2-confirmed-seek
+          fetch-depth: 0
+      - name: Verify exact source tree
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD^)" = "37ad562a139c693ded726bbb6fd9f623f4579e70"
+          test -z "$(git diff --name-only 37ad562a139c693ded726bbb6fd9f623f4579e70...HEAD | grep -v '^\.github/')"
+          test "$(git diff --name-only f80ad2ee8a73e5e32a82df20c98666385c6b2aca..37ad562a139c693ded726bbb6fd9f623f4579e70 | grep -Ev '^\.github/' | wc -l | tr -d ' ')" = "6"
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Resolve and test
+        shell: bash
+        run: |
+          (cd just_audio_platform_interface && flutter pub get --no-example && flutter analyze)
+          (cd just_audio && flutter pub get --no-example)
+          git checkout -- just_audio_platform_interface/analysis_options.yaml just_audio/analysis_options.yaml
+          (cd just_audio && flutter analyze lib test --no-fatal-warnings && flutter test)
+      - name: Android debug compile
+        shell: bash
+        run: |
+          flutter create --platforms=android --org dev.kyomorie /tmp/p2_final_android
+          ROOT="$GITHUB_WORKSPACE"
+          cat > /tmp/p2_final_android/pubspec.yaml <<EOF
+          name: p2_final_android
+          publish_to: none
+          environment:
+            sdk: ">=3.1.3 <4.0.0"
+          dependencies:
+            flutter:
+              sdk: flutter
+            just_audio:
+              path: $ROOT/just_audio
+          flutter:
+            uses-material-design: true
+          EOF
+          cat > /tmp/p2_final_android/lib/main.dart <<'EOF'
+          import 'package:flutter/widgets.dart';
+          import 'package:just_audio/just_audio.dart';
+          void main() {
+            WidgetsFlutterBinding.ensureInitialized();
+            final player = AudioPlayer();
+            player.seekConfirmed(const Duration(seconds: 1));
+            runApp(const SizedBox.shrink());
+          }
+          EOF
+          (cd /tmp/p2_final_android && flutter pub get && flutter build apk --debug)
+
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: automation/p2-confirmed-seek
+          fetch-depth: 0
+      - name: Verify exact source tree
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD^)" = "37ad562a139c693ded726bbb6fd9f623f4579e70"
+          test -z "$(git diff --name-only 37ad562a139c693ded726bbb6fd9f623f4579e70...HEAD | grep -v '^\.github/')"
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Resolve and test
+        shell: bash
+        run: |
+          (cd just_audio_platform_interface && flutter pub get --no-example && flutter analyze)
+          (cd just_audio && flutter pub get --no-example)
+          git checkout -- just_audio_platform_interface/analysis_options.yaml just_audio/analysis_options.yaml
+          (cd just_audio && flutter analyze lib test --no-fatal-warnings && flutter test)
+      - name: macOS debug compile
+        shell: bash
+        run: |
+          flutter create --platforms=macos --org dev.kyomorie /tmp/p2_final_macos
+          ROOT="$GITHUB_WORKSPACE"
+          cat > /tmp/p2_final_macos/pubspec.yaml <<EOF
+          name: p2_final_macos
+          publish_to: none
+          environment:
+            sdk: ">=3.1.3 <4.0.0"
+          dependencies:
+            flutter:
+              sdk: flutter
+            just_audio:
+              path: $ROOT/just_audio
+          flutter:
+            uses-material-design: true
+          EOF
+          cat > /tmp/p2_final_macos/lib/main.dart <<'EOF'
+          import 'package:flutter/widgets.dart';
+          import 'package:just_audio/just_audio.dart';
+          void main() {
+            WidgetsFlutterBinding.ensureInitialized();
+            final player = AudioPlayer();
+            player.seekConfirmed(const Duration(seconds: 1));
+            runApp(const SizedBox.shrink());
+          }
+          EOF
+          (cd /tmp/p2_final_macos && flutter pub get && flutter build macos --debug)
