@@ -33,29 +33,30 @@ jobs:
         run: |
           python3 <<'PY'
           from pathlib import Path
+          import textwrap
 
           source = Path('just_audio/lib/just_audio.dart')
           text = source.read_text()
-          old = '''      if (!playing) {
-                _completePlayRequestDispatch(
-                  playRequestDispatchCompleter,
-                  dispatched: false,
-                );
-                return;
-              }
-              final playFuture = platform.play(PlayRequest());
-              _completePlayRequestDispatch(
-                playRequestDispatchCompleter,
-                dispatched: true,
-              );
-              await playFuture;
-              playCompleter?.complete();
-            } catch (e, stackTrace) {
-              playCompleter?.completeError(e, stackTrace);
-            }
-          }
-          '''
-          new = '''      if (!playing) {
+          start = text.index('  Future<void> _sendPlayRequest(')
+          end = text.index('\n  /// Stops playing audio', start)
+          body = text[start:end]
+          required_fragments = [
+              'if (!playing)',
+              'final playFuture = platform.play(PlayRequest());',
+              'playCompleter?.complete();',
+              'playCompleter?.completeError(e, stackTrace);',
+          ]
+          for fragment in required_fragments:
+              if fragment not in body:
+                  raise SystemExit(f'Unexpected _sendPlayRequest body: missing {fragment}')
+          replacement = textwrap.indent(textwrap.dedent('''\
+          Future<void> _sendPlayRequest(
+            AudioPlayerPlatform platform,
+            Completer<void>? playCompleter, {
+            Completer<bool>? playRequestDispatchCompleter,
+          }) async {
+            try {
+              if (!playing) {
                 _completePlayRequestDispatch(
                   playRequestDispatchCompleter,
                   dispatched: false,
@@ -87,88 +88,76 @@ jobs:
               }
             }
           }
-          '''
-          if text.count(old) != 1:
-              raise SystemExit('Unexpected _sendPlayRequest body')
-          source.write_text(text.replace(old, new, 1))
+          '''), '  ').rstrip()
+          source.write_text(text[:start] + replacement + text[end:])
 
           test = Path('just_audio/test/just_audio_test.dart')
           t = test.read_text()
 
-          mock_fields = '''  MockAudioPlayer? mostRecentPlayer;
-            final _players = <String, MockAudioPlayer>{};
-          '''
-          mock_fields_new = '''  MockAudioPlayer? mostRecentPlayer;
-            final _players = <String, MockAudioPlayer>{};
-            void Function()? onPlayerSetVolume;
-          '''
-          if t.count(mock_fields) != 1:
+          marker = '  final _players = <String, MockAudioPlayer>{};\n'
+          if t.count(marker) != 1:
               raise SystemExit('Unexpected MockJustAudio fields')
-          t = t.replace(mock_fields, mock_fields_new, 1)
+          t = t.replace(marker, marker + '  void Function()? onPlayerSetVolume;\n', 1)
 
-          init_old = '''    final player = MockAudioPlayer(request);
-              _players[request.id] = player;
-          '''
-          init_new = '''    final player = MockAudioPlayer(request)
-                ..onSetVolume = onPlayerSetVolume;
-              _players[request.id] = player;
-          '''
-          if t.count(init_old) != 1:
+          marker = '    final player = MockAudioPlayer(request);\n'
+          if t.count(marker) != 1:
               raise SystemExit('Unexpected MockJustAudio init')
-          t = t.replace(init_old, init_new, 1)
+          t = t.replace(
+              marker,
+              '    final player = MockAudioPlayer(request)\n'
+              '      ..onSetVolume = onPlayerSetVolume;\n',
+              1,
+          )
 
-          player_field = '''  int playCallCount = 0;
-          '''
-          player_field_new = '''  int playCallCount = 0;
-            void Function()? onSetVolume;
-          '''
-          if t.count(player_field) != 1:
+          marker = '  int playCallCount = 0;\n'
+          if t.count(marker) != 1:
               raise SystemExit('Unexpected MockAudioPlayer fields')
-          t = t.replace(player_field, player_field_new, 1)
+          t = t.replace(marker, marker + '  void Function()? onSetVolume;\n', 1)
 
-          set_volume_old = '''  Future<SetVolumeResponse> setVolume(SetVolumeRequest request) async {
-              return SetVolumeResponse();
-            }
-          '''
-          set_volume_new = '''  Future<SetVolumeResponse> setVolume(SetVolumeRequest request) async {
-              onSetVolume?.call();
-              return SetVolumeResponse();
-            }
-          '''
-          if t.count(set_volume_old) != 1:
+          set_start = t.index('  Future<SetVolumeResponse> setVolume(SetVolumeRequest request) async {')
+          set_end = t.index('\n  }\n', set_start) + len('\n  }')
+          set_body = t[set_start:set_end]
+          if 'return SetVolumeResponse();' not in set_body or 'onSetVolume' in set_body:
               raise SystemExit('Unexpected setVolume mock')
-          t = t.replace(set_volume_old, set_volume_new, 1)
+          set_replacement = textwrap.indent(textwrap.dedent('''\
+          Future<SetVolumeResponse> setVolume(SetVolumeRequest request) async {
+            onSetVolume?.call();
+            return SetVolumeResponse();
+          }
+          '''), '  ').rstrip()
+          t = t[:set_start] + set_replacement + t[set_end:]
 
           anchor = "  test('playback start acknowledgment fails closed without native dispatch',\n"
           if t.count(anchor) != 1:
               raise SystemExit('Unexpected playback ack test anchor')
-          regression = '''  test('play completes when paused before native play dispatch', () async {
-              final player = AudioPlayer(handleAudioSessionActivation: false);
-              await player.setUrl('https://foo.foo/foo.mp3', preload: false);
-              final pauseCompleted = Completer<void>();
-              var pauseTriggered = false;
-              mock.onPlayerSetVolume = () {
-                if (pauseTriggered) return;
-                pauseTriggered = true;
-                unawaited(player.pause().whenComplete(() {
-                  if (!pauseCompleted.isCompleted) pauseCompleted.complete();
-                }));
-              };
+          regression = textwrap.indent(textwrap.dedent('''\
+          test('play completes when paused before native play dispatch', () async {
+            final player = AudioPlayer(handleAudioSessionActivation: false);
+            await player.setUrl('https://foo.foo/foo.mp3', preload: false);
+            final pauseCompleted = Completer<void>();
+            var pauseTriggered = false;
+            mock.onPlayerSetVolume = () {
+              if (pauseTriggered) return;
+              pauseTriggered = true;
+              unawaited(player.pause().whenComplete(() {
+                if (!pauseCompleted.isCompleted) pauseCompleted.complete();
+              }));
+            };
 
-              final playFuture = player.play();
-              await playFuture.timeout(const Duration(seconds: 2));
-              await pauseCompleted.future.timeout(const Duration(seconds: 2));
-              final platform = mock.mostRecentPlayer!;
+            final playFuture = player.play();
+            await playFuture.timeout(const Duration(seconds: 2));
+            await pauseCompleted.future.timeout(const Duration(seconds: 2));
+            final platform = mock.mostRecentPlayer!;
 
-              expect(pauseTriggered, isTrue);
-              expect(player.playing, isFalse);
-              expect(platform.playCallCount, 0);
+            expect(pauseTriggered, isTrue);
+            expect(player.playing, isFalse);
+            expect(platform.playCallCount, 0);
 
-              mock.onPlayerSetVolume = null;
-              await player.dispose();
-            });
+            mock.onPlayerSetVolume = null;
+            await player.dispose();
+          });
 
-          '''
+          '''), '  ')
           t = t.replace(anchor, regression + anchor, 1)
           test.write_text(t)
           PY
