@@ -1707,6 +1707,32 @@ void runTests() {
     await player.dispose();
   });
 
+  test('play completes when paused before native play dispatch', () async {
+    final player = AudioPlayer(handleAudioSessionActivation: false);
+    await player.setUrl('https://foo.foo/foo.mp3', preload: false);
+    final pauseCompleted = Completer<void>();
+    var pauseTriggered = false;
+    mock.onPlayerSetVolume = () {
+      if (pauseTriggered) return;
+      pauseTriggered = true;
+      unawaited(player.pause().whenComplete(() {
+        if (!pauseCompleted.isCompleted) pauseCompleted.complete();
+      }));
+    };
+
+    final playFuture = player.play();
+    await playFuture.timeout(const Duration(seconds: 2));
+    await pauseCompleted.future.timeout(const Duration(seconds: 2));
+    final platform = mock.mostRecentPlayer!;
+
+    expect(pauseTriggered, isTrue);
+    expect(player.playing, isFalse);
+    expect(platform.playCallCount, 0);
+
+    mock.onPlayerSetVolume = null;
+    await player.dispose();
+  });
+
   test('playback start acknowledgment fails closed without native dispatch',
       () async {
     final player = AudioPlayer(handleAudioSessionActivation: false);
@@ -1791,6 +1817,7 @@ class MockJustAudio extends Mock
     implements JustAudioPlatform {
   MockAudioPlayer? mostRecentPlayer;
   final _players = <String, MockAudioPlayer>{};
+  void Function()? onPlayerSetVolume;
 
   @override
   Future<AudioPlayerPlatform> init(InitRequest request) async {
@@ -1799,7 +1826,7 @@ class MockJustAudio extends Mock
           code: "error",
           message: "Platform player ${request.id} already exists");
     }
-    final player = MockAudioPlayer(request);
+    final player = MockAudioPlayer(request)..onSetVolume = onPlayerSetVolume;
     _players[request.id] = player;
     mostRecentPlayer = player;
     return player;
@@ -1882,6 +1909,7 @@ class MockAudioPlayer extends AudioPlayerPlatform {
   int awaitPlaybackStartCallCount = 0;
   String? lastPlaybackStartAttemptId;
   int playCallCount = 0;
+  void Function()? onSetVolume;
 
   MockAudioPlayer(InitRequest request)
       : audioLoadConfiguration = request.audioLoadConfiguration,
@@ -2089,6 +2117,7 @@ class MockAudioPlayer extends AudioPlayerPlatform {
 
   @override
   Future<SetVolumeResponse> setVolume(SetVolumeRequest request) async {
+    onSetVolume?.call();
     return SetVolumeResponse();
   }
 

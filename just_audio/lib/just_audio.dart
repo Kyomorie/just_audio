@@ -1366,6 +1366,9 @@ class AudioPlayer {
           playRequestDispatchCompleter,
           dispatched: false,
         );
+        if (playCompleter != null && !playCompleter.isCompleted) {
+          playCompleter.complete();
+        }
         return;
       }
       final playFuture = platform.play(PlayRequest());
@@ -1374,9 +1377,20 @@ class AudioPlayer {
         dispatched: true,
       );
       await playFuture;
-      playCompleter?.complete();
+      if (playCompleter != null && !playCompleter.isCompleted) {
+        playCompleter.complete();
+      }
     } catch (e, stackTrace) {
-      playCompleter?.completeError(e, stackTrace);
+      if (playRequestDispatchCompleter != null &&
+          !playRequestDispatchCompleter.isCompleted) {
+        _completePlayRequestDispatch(
+          playRequestDispatchCompleter,
+          dispatched: false,
+        );
+      }
+      if (playCompleter != null && !playCompleter.isCompleted) {
+        playCompleter.completeError(e, stackTrace);
+      }
     }
   }
 
