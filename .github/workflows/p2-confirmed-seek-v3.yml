@@ -1,0 +1,130 @@
+name: P2 confirmed seek v3
+
+on:
+  push:
+    branches:
+      - automation/p2-confirmed-seek
+    paths:
+      - .github/workflows/p2-confirmed-seek-v3.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch-test-android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: automation/p2-confirmed-seek
+          fetch-depth: 0
+      - name: Verify source baseline
+        shell: bash
+        run: |
+          git fetch origin feat/backend-playback-ack
+          test "$(git rev-parse origin/feat/backend-playback-ack)" = "f80ad2ee8a73e5e32a82df20c98666385c6b2aca"
+          test -z "$(git diff --name-only origin/feat/backend-playback-ack...HEAD | grep -v '^\.github/')"
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Resolve package language versions without examples
+        shell: bash
+        run: |
+          (cd just_audio_platform_interface && flutter pub get --no-example)
+          (cd just_audio && flutter pub get --no-example)
+          git checkout -- just_audio_platform_interface/analysis_options.yaml just_audio/analysis_options.yaml
+      - name: Apply confirmed seek contract
+        run: python3 .github/scripts/apply-p2-confirmed-seek-v2.py
+      - name: Format and diff-check
+        shell: bash
+        run: |
+          dart format just_audio/lib/just_audio.dart just_audio/test/just_audio_test.dart just_audio_platform_interface/lib/just_audio_platform_interface.dart just_audio_platform_interface/lib/method_channel_just_audio.dart
+          git diff --check
+      - name: Platform interface analyze
+        working-directory: just_audio_platform_interface
+        run: flutter analyze
+      - name: just_audio analyze and tests
+        working-directory: just_audio
+        shell: bash
+        run: |
+          set -o pipefail
+          flutter analyze lib test --no-fatal-warnings 2>&1 | tee /tmp/p2-analyze.txt
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+          issues = [line for line in Path('/tmp/p2-analyze.txt').read_text().splitlines() if re.match(r'^\s*(error|warning|info) •', line)]
+          errors = [line for line in issues if 'error •' in line]
+          if errors:
+              raise SystemExit(f'Analyzer errors: {errors}')
+          unexpected_warnings = [line for line in issues if 'warning •' in line and 'unawaited_return_in_try_block' not in line]
+          if unexpected_warnings:
+              raise SystemExit(f'Unexpected analyzer warnings: {unexpected_warnings}')
+          PY
+          flutter test
+      - name: Create isolated Android compile host
+        shell: bash
+        run: |
+          flutter create --platforms=android --org dev.kyomorie /tmp/p2_android_smoke
+          python3 <<'PY'
+          import os
+          from pathlib import Path
+          root = Path(os.environ['GITHUB_WORKSPACE'])
+          Path('/tmp/p2_android_smoke/pubspec.yaml').write_text(f'''name: p2_android_smoke
+          publish_to: none
+          environment:
+            sdk: ">=3.1.3 <4.0.0"
+          dependencies:
+            flutter:
+              sdk: flutter
+            just_audio:
+              path: {root / 'just_audio'}
+          flutter:
+            uses-material-design: true
+          '''.replace('          ', ''))
+          Path('/tmp/p2_android_smoke/lib/main.dart').write_text('''import 'package:flutter/widgets.dart';
+          import 'package:just_audio/just_audio.dart';
+
+          void main() {
+            WidgetsFlutterBinding.ensureInitialized();
+            final player = AudioPlayer();
+            player.seekConfirmed(const Duration(seconds: 1));
+            runApp(const SizedBox.shrink());
+          }
+          '''.replace('          ', ''))
+          PY
+      - name: Android smoke compile
+        working-directory: /tmp/p2_android_smoke
+        run: |
+          flutter pub get
+          flutter build apk --debug
+      - name: Restore toolchain side effects and enforce source scope
+        shell: bash
+        run: |
+          git checkout -- just_audio_platform_interface/analysis_options.yaml just_audio/analysis_options.yaml
+          git checkout -- just_audio_platform_interface/pubspec.lock just_audio/pubspec.lock 2>/dev/null || true
+          git diff --check
+          allowed='^(just_audio/android/src/main/java/com/ryanheise/just_audio/AudioPlayer.java|just_audio/darwin/just_audio/Sources/just_audio/AudioPlayer.m|just_audio/lib/just_audio.dart|just_audio/test/just_audio_test.dart|just_audio_platform_interface/lib/just_audio_platform_interface.dart|just_audio_platform_interface/lib/method_channel_just_audio.dart)$'
+          unexpected="$(git diff --name-only | grep -Ev "$allowed" || true)"
+          if [[ -n "$unexpected" ]]; then
+            echo "Unexpected changed paths:"
+            printf '%s\n' "$unexpected"
+            exit 1
+          fi
+          count="$(git diff --name-only | wc -l | tr -d ' ')"
+          test "$count" = 6
+      - name: Commit staged implementation
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            just_audio/android/src/main/java/com/ryanheise/just_audio/AudioPlayer.java \
+            just_audio/darwin/just_audio/Sources/just_audio/AudioPlayer.m \
+            just_audio/lib/just_audio.dart \
+            just_audio/test/just_audio_test.dart \
+            just_audio_platform_interface/lib/just_audio_platform_interface.dart \
+            just_audio_platform_interface/lib/method_channel_just_audio.dart
+          git commit -m "feat: expose backend-confirmed seek results"
+          git push origin HEAD:automation/p2-confirmed-seek
