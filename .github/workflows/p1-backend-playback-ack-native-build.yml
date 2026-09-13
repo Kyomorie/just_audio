@@ -1,0 +1,94 @@
+name: P1 backend playback acknowledgment native compile
+
+on:
+  push:
+    branches:
+      - automation/p1-just-audio-apply
+    paths:
+      - .github/workflows/p1-backend-playback-ack-native-build.yml
+
+permissions:
+  contents: read
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: feat/backend-playback-ack
+      - name: Verify exact source head
+        shell: bash
+        run: |
+          expected='16de0252e42b3badc817fbc2e18d03d6feea2b7f'
+          actual="$(git rev-parse HEAD)"
+          if [[ "$actual" != "$expected" ]]; then
+            echo "Unexpected source head: $actual" >&2
+            exit 1
+          fi
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Create Android smoke app
+        shell: bash
+        run: |
+          flutter create --platforms=android --org dev.kyomorie /tmp/p1_android_smoke
+          python3 <<'PY'
+          from pathlib import Path
+          path = Path('/tmp/p1_android_smoke/pubspec.yaml')
+          text = path.read_text()
+          needle = "dependencies:\n  flutter:\n    sdk: flutter\n"
+          replacement = needle + "  just_audio:\n    path: $GITHUB_WORKSPACE/just_audio\n"
+          if text.count(needle) != 1:
+              raise SystemExit('Unexpected generated pubspec structure')
+          path.write_text(text.replace(needle, replacement, 1))
+          PY
+      - name: Compile Android plugin integration
+        working-directory: /tmp/p1_android_smoke
+        shell: bash
+        run: |
+          flutter pub get
+          flutter build apk --debug
+
+  darwin:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: feat/backend-playback-ack
+      - name: Verify exact source head
+        shell: bash
+        run: |
+          expected='16de0252e42b3badc817fbc2e18d03d6feea2b7f'
+          actual="$(git rev-parse HEAD)"
+          if [[ "$actual" != "$expected" ]]; then
+            echo "Unexpected source head: $actual" >&2
+            exit 1
+          fi
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Create macOS smoke app
+        shell: bash
+        run: |
+          flutter create --platforms=macos --org dev.kyomorie /tmp/p1_macos_smoke
+          python3 <<'PY'
+          from pathlib import Path
+          path = Path('/tmp/p1_macos_smoke/pubspec.yaml')
+          text = path.read_text()
+          needle = "dependencies:\n  flutter:\n    sdk: flutter\n"
+          replacement = needle + "  just_audio:\n    path: $GITHUB_WORKSPACE/just_audio\n"
+          if text.count(needle) != 1:
+              raise SystemExit('Unexpected generated pubspec structure')
+          path.write_text(text.replace(needle, replacement, 1))
+          PY
+      - name: Compile Darwin plugin integration
+        working-directory: /tmp/p1_macos_smoke
+        shell: bash
+        run: |
+          flutter pub get
+          flutter build macos --debug
