@@ -1171,6 +1171,7 @@
 - (void)complete {
     [self updatePosition];
     _processingState = psCompleted;
+    [self evaluatePlaybackStart];
     [self broadcastPlaybackEvent];
     if (_playResult) {
         //NSLog(@"PLAY FINISHED DUE TO COMPLETE");
