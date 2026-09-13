@@ -1,0 +1,181 @@
+name: P1 backend playback acknowledgment contract tests v2
+
+on:
+  push:
+    branches:
+      - automation/p1-just-audio-apply
+    paths:
+      - .github/workflows/p1-backend-playback-ack-contract-tests-v2.yml
+
+permissions: {}
+
+jobs:
+  apply-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout exact target branch
+        uses: actions/checkout@v6
+        with:
+          ref: feat/backend-playback-ack
+          fetch-depth: 2
+
+      - name: Verify exact target head
+        shell: bash
+        run: |
+          expected='ff7d0eb1d8697a3da6c3827aeb586d5df505b0bd'
+          actual="$(git rev-parse HEAD)"
+          if [[ "$actual" != "$expected" ]]; then
+            echo "Unexpected target head: $actual" >&2
+            exit 1
+          fi
+
+      - name: Apply asserted contract tests
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path('just_audio/test/just_audio_test.dart')
+          text = path.read_text()
+
+          async_marker = "  test('asyncMessages', () async {\n"
+          class_marker = "\n}\n\nclass MockJustAudio extends Mock"
+          async_start = text.index(async_marker)
+          async_end = text.index(class_marker, async_start)
+          async_block = text[async_start:async_end]
+
+          def replace_once_in(value, old, new, label):
+              count = value.count(old)
+              if count != 1:
+                  raise SystemExit(f'{label}: expected exactly one match, found {count}: {old[:120]!r}')
+              return value.replace(old, new, 1)
+
+          async_block = replace_once_in(
+              async_block,
+              """    expect(player.playing, equals(false));\n    expect(player.volume, equals(1.0));\n""",
+              """    expect(player.playing, equals(false));\n    expect(player.effectivePlaying, equals(false));\n    expect(player.volume, equals(1.0));\n""",
+              'async initial state',
+          )
+          async_block = replace_once_in(
+              async_block,
+              """    platform._broadcastDataMessage(PlayerDataMessage(\n      playing: true,\n      volume: 0.7,\n""",
+              """    platform._broadcastDataMessage(PlayerDataMessage(\n      playing: true,\n      effectivePlaying: true,\n      volume: 0.7,\n""",
+              'async data message',
+          )
+          async_block = replace_once_in(
+              async_block,
+              """    expect(player.playing, equals(true));\n    expect(player.volume, equals(0.7));\n""",
+              """    expect(player.playing, equals(true));\n    expect(player.effectivePlaying, equals(true));\n    expect(player.volume, equals(0.7));\n""",
+              'async updated state',
+          )
+          text = text[:async_start] + async_block + text[async_end:]
+
+          tests = """  test('backend playback start acknowledgment', () async {\n    final player = AudioPlayer();\n    await player.setUrl('https://foo.foo/foo.mp3');\n    final platform = mock.mostRecentPlayer!;\n\n    unawaited(player.play());\n    final result = await player.waitForPlaybackStart();\n\n    expect(result.status, PlaybackStartStatus.started);\n    expect(result.started, isTrue);\n    expect(platform.awaitPlaybackStartCallCount, 1);\n    expect(platform.lastPlaybackStartAttemptId, isNotEmpty);\n\n    await player.pause();\n    await player.dispose();\n  });\n\n  test('playback start acknowledgment rejects without play intent', () async {\n    final player = AudioPlayer();\n    await player.setUrl('https://foo.foo/foo.mp3');\n    final platform = mock.mostRecentPlayer!;\n\n    final result = await player.waitForPlaybackStart();\n\n    expect(result.status, PlaybackStartStatus.rejected);\n    expect(result.started, isFalse);\n    expect(platform.awaitPlaybackStartCallCount, 0);\n\n    await player.dispose();\n  });\n\n  test('playback start acknowledgment propagates superseded', () async {\n    final player = AudioPlayer();\n    await player.setUrl('https://foo.foo/foo.mp3');\n    final platform = mock.mostRecentPlayer!\n      ..playbackStartStatus = PlaybackStartStatusMessage.superseded;\n\n    unawaited(player.play());\n    final result = await player.waitForPlaybackStart();\n\n    expect(result.status, PlaybackStartStatus.superseded);\n    expect(result.started, isFalse);\n    expect(platform.awaitPlaybackStartCallCount, 1);\n\n    await player.pause();\n    await player.dispose();\n  });\n\n"""
+          count = text.count(async_marker)
+          if count != 1:
+              raise SystemExit(f'async marker count changed: {count}')
+          text = text.replace(async_marker, tests + async_marker, 1)
+
+          mock_start = text.index('class MockAudioPlayer extends AudioPlayerPlatform {')
+          mock_text = text[mock_start:]
+          mock_text = replace_once_in(
+              mock_text,
+              """  Completer<void>? _loadBlock;\n\n  MockAudioPlayer(InitRequest request)\n""",
+              """  Completer<void>? _loadBlock;\n  PlaybackStartStatusMessage playbackStartStatus =\n      PlaybackStartStatusMessage.started;\n  String? playbackStartErrorMessage;\n  int awaitPlaybackStartCallCount = 0;\n  String? lastPlaybackStartAttemptId;\n\n  MockAudioPlayer(InitRequest request)\n""",
+              'mock fields',
+          )
+          mock_text = replace_once_in(
+              mock_text,
+              """  @override\n  Future<PauseResponse> pause(PauseRequest request) async {\n""",
+              """  @override\n  Future<AwaitPlaybackStartResponse> awaitPlaybackStart(\n      AwaitPlaybackStartRequest request) async {\n    awaitPlaybackStartCallCount++;\n    lastPlaybackStartAttemptId = request.attemptId;\n    return AwaitPlaybackStartResponse(\n      status: playbackStartStatus,\n      errorMessage: playbackStartErrorMessage,\n    );\n  }\n\n  @override\n  Future<PauseResponse> pause(PauseRequest request) async {\n""",
+              'mock ack method',
+          )
+          text = text[:mock_start] + mock_text
+          path.write_text(text)
+          PY
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Resolve package language version
+        working-directory: just_audio
+        shell: bash
+        run: |
+          flutter pub get --no-example
+          git checkout -- analysis_options.yaml
+
+      - name: Format and validate test-only scope
+        shell: bash
+        run: |
+          dart format just_audio/test/just_audio_test.dart
+          git diff --check
+          actual="$(git diff --name-only)"
+          expected='just_audio/test/just_audio_test.dart'
+          if [[ "$actual" != "$expected" ]]; then
+            echo "Unexpected changed paths: $actual" >&2
+            exit 1
+          fi
+
+      - name: Analyze against known baseline and run all tests
+        working-directory: just_audio
+        shell: bash
+        run: |
+          flutter analyze lib test --no-fatal-warnings 2>&1 | tee /tmp/analyze.txt
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+          text = Path('/tmp/analyze.txt').read_text()
+          issues = [line for line in text.splitlines() if re.match(r'^\s*(error|warning|info) •', line)]
+          if len(issues) != 1:
+              raise SystemExit(f'Expected one known baseline analyzer issue, got {len(issues)}: {issues}')
+          issue = issues[0]
+          if 'warning •' not in issue or 'unawaited_return_in_try_block' not in issue:
+              raise SystemExit(f'Unexpected analyzer issue: {issue}')
+          PY
+          flutter test
+
+      - name: Restore toolchain side effects and revalidate scope
+        shell: bash
+        run: |
+          git checkout -- just_audio/analysis_options.yaml
+          git diff --check
+          actual="$(git diff --name-only)"
+          expected='just_audio/test/just_audio_test.dart'
+          if [[ "$actual" != "$expected" ]]; then
+            echo "Unexpected changed paths after validation: $actual" >&2
+            exit 1
+          fi
+
+      - name: Commit validated contract tests
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add just_audio/test/just_audio_test.dart
+          git commit -m 'test: cover backend playback start acknowledgment'
+
+      - name: Push only if target branch is unchanged
+        shell: bash
+        run: |
+          expected='ff7d0eb1d8697a3da6c3827aeb586d5df505b0bd'
+          remote_head="$(git ls-remote origin refs/heads/feat/backend-playback-ack | cut -f1)"
+          if [[ "$remote_head" != "$expected" ]]; then
+            echo "Target branch moved externally: $remote_head" >&2
+            exit 1
+          fi
+          if [[ "$(git rev-parse HEAD^)" != "$expected" ]]; then
+            echo 'Validated test commit has unexpected parent.' >&2
+            exit 1
+          fi
+          if [[ -n "$(git status --porcelain)" ]]; then
+            echo 'Working tree is dirty after validation.' >&2
+            git status --short >&2
+            exit 1
+          fi
+          git push origin HEAD:refs/heads/feat/backend-playback-ack
