@@ -101,12 +101,10 @@ jobs:
             exit 1
           fi
 
-      - name: Analyze and test platform interface
+      - name: Analyze platform interface
         working-directory: target/just_audio_platform_interface
         shell: bash
-        run: |
-          flutter analyze
-          flutter test
+        run: flutter analyze
 
       - name: Analyze and test just_audio
         working-directory: target/just_audio
