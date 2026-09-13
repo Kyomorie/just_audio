@@ -130,6 +130,27 @@ jobs:
           PY
           flutter test
 
+      - name: Restore toolchain side effects and revalidate scope
+        working-directory: target
+        shell: bash
+        run: |
+          git checkout -- \
+            just_audio_platform_interface/analysis_options.yaml \
+            just_audio/analysis_options.yaml
+          git diff --check
+          actual="$(git diff --name-only | sort)"
+          expected="$(printf '%s\n' \
+            just_audio/android/src/main/java/com/ryanheise/just_audio/AudioPlayer.java \
+            just_audio/darwin/just_audio/Sources/just_audio/AudioPlayer.m \
+            just_audio/lib/just_audio.dart \
+            just_audio_platform_interface/lib/just_audio_platform_interface.dart \
+            just_audio_platform_interface/lib/method_channel_just_audio.dart | sort)"
+          if [[ "$actual" != "$expected" ]]; then
+            echo 'Unexpected changed paths after validation:' >&2
+            printf '%s\n' "$actual" >&2
+            exit 1
+          fi
+
       - name: Commit validated source
         working-directory: target
         shell: bash
