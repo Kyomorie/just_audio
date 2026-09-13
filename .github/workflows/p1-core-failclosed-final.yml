@@ -33,24 +33,20 @@ jobs:
         run: |
           python3 <<'PY'
           from pathlib import Path
+          import textwrap
 
           source = Path('just_audio/lib/just_audio.dart')
           text = source.read_text()
 
           field = '  Completer<void>? _playRequestDispatchCompleter;\n'
-          assert text.count(field) == 1, 'unexpected dispatch field'
+          if text.count(field) != 1:
+              raise SystemExit('unexpected dispatch field')
           text = text.replace(field, '  Completer<bool>? _playRequestDispatchCompleter;\n', 1)
 
-          old_helper = """  void _completePlayRequestDispatch(Completer<void>? completer) {
-            if (completer != null && !completer.isCompleted) {
-              completer.complete();
-            }
-            if (identical(_playRequestDispatchCompleter, completer)) {
-              _playRequestDispatchCompleter = null;
-            }
-          }
-          """
-          new_helper = """  void _completePlayRequestDispatch(
+          helper_start = text.index('  void _completePlayRequestDispatch(Completer<void>? completer) {')
+          helper_end = text.index('\n\n  Future<void> play() async {', helper_start)
+          new_helper = textwrap.indent(textwrap.dedent('''\
+          void _completePlayRequestDispatch(
             Completer<bool>? completer, {
             required bool dispatched,
           }) {
@@ -58,82 +54,13 @@ jobs:
               completer.complete(dispatched);
             }
           }
-          """
-          assert text.count(old_helper) == 1, 'unexpected dispatch helper'
-          text = text.replace(old_helper, new_helper, 1)
+          '''), '  ').rstrip()
+          text = text[:helper_start] + new_helper + text[helper_end:]
 
-          old_play = """  Future<void> play() async {
-            if (_disposed) return;
-            if (playing) return;
-            _playInterrupted = false;
-            final playRequestDispatchCompleter = Completer<void>();
-            _playRequestGeneration++;
-            _playRequestDispatchCompleter = playRequestDispatchCompleter;
-            // Broadcast to clients immediately, but revert to false if we fail to
-            // activate the audio session. This allows setAudioSource to be aware of a
-            // prior play request.
-            _playerEventSubject.add(PlayerEvent(
-              playing: true,
-              playbackEvent: playbackEvent.copyWith(
-                updatePosition: position,
-                updateTime: DateTime.now(),
-              ),
-            ));
-            final playCompleter = Completer<dynamic>();
-            try {
-              final audioSession = await AudioSession.instance;
-              if (!_handleAudioSessionActivation ||
-                  await audioSession.setActive(true)) {
-                if (!playing) {
-                  _completePlayRequestDispatch(playRequestDispatchCompleter);
-                  return;
-                }
-                // TODO: rewrite this to more cleanly handle simultaneous load/play
-                // requests which each may result in platform play requests.
-                final requireActive = _playlist.children.isNotEmpty;
-                if (requireActive) {
-                  if (_active) {
-                    // If the native platform is already active, send it a play request.
-                    // NOTE: If a load() request happens simultaneously, this may result
-                    // in two play requests being sent. The platform implementation should
-                    // ignore the second play request since it is already playing.
-                    _sendPlayRequest(
-                      await _platform,
-                      playCompleter,
-                      playRequestDispatchCompleter: playRequestDispatchCompleter,
-                    );
-                  } else {
-                    // If the native platform wasn't already active, activating it will
-                    // implicitly restore the playing state and send a play request.
-                    final activation = _setPlatformActive(
-                      true,
-                      playCompleter: playCompleter,
-                      playRequestDispatchCompleter: playRequestDispatchCompleter,
-                    );
-                    if (activation != null) {
-                      unawaited(activation.whenComplete(() {
-                        _completePlayRequestDispatch(playRequestDispatchCompleter);
-                      }).catchError((dynamic e) async => null));
-                    } else {
-                      _completePlayRequestDispatch(playRequestDispatchCompleter);
-                    }
-                  }
-                } else {
-                  _completePlayRequestDispatch(playRequestDispatchCompleter);
-                }
-              } else {
-                // Revert if we fail to activate the audio session.
-                _playerEventSubject.add(playerEvent.copyWith(playing: false));
-                _completePlayRequestDispatch(playRequestDispatchCompleter);
-              }
-            } catch (_) {
-              _completePlayRequestDispatch(playRequestDispatchCompleter);
-              rethrow;
-            }
-            await playCompleter.future;
-          }
-          """
-          new_play = """  Future<void> play() async {
+          play_start = text.index('  Future<void> play() async {')
+          play_end = text.index('\n  /// Pauses the currently playing media.', play_start)
+          new_play = textwrap.indent(textwrap.dedent('''\
+          Future<void> play() async {
             if (_disposed) return;
             if (playing) return;
             _playInterrupted = false;
@@ -239,80 +166,56 @@ jobs:
             }
             await playCompleter.future;
           }
-          """
-          assert text.count(old_play) == 1, 'unexpected play implementation'
-          text = text.replace(old_play, new_play, 1)
+          '''), '  ').rstrip()
+          text = text[:play_start] + new_play + text[play_end:]
 
-          old_pause = """    _playRequestGeneration++;
-            _completePlayRequestDispatch(_playRequestDispatchCompleter);
-          """
-          new_pause = """    _playRequestGeneration++;
-            _completePlayRequestDispatch(
-              _playRequestDispatchCompleter,
-              dispatched: false,
-            );
-          """
-          assert text.count(old_pause) == 2, 'unexpected pause/stop settlements'
+          old_pause = '    _playRequestGeneration++;\n    _completePlayRequestDispatch(_playRequestDispatchCompleter);\n'
+          new_pause = ('    _playRequestGeneration++;\n'
+                       '    _completePlayRequestDispatch(\n'
+                       '      _playRequestDispatchCompleter,\n'
+                       '      dispatched: false,\n'
+                       '    );\n')
+          if text.count(old_pause) != 2:
+              raise SystemExit(f'unexpected pause/stop settlements: {text.count(old_pause)}')
           text = text.replace(old_pause, new_pause, 2)
 
-          old_wait = """    final playRequestGeneration = _playRequestGeneration;
-            final playRequestDispatchCompleter = _playRequestDispatchCompleter;
-            if (playRequestDispatchCompleter != null &&
-                !playRequestDispatchCompleter.isCompleted) {
-              await playRequestDispatchCompleter.future;
-            }
-            if (_disposed) {
-          """
-          new_wait = """    final playRequestGeneration = _playRequestGeneration;
-            final playRequestDispatchCompleter = _playRequestDispatchCompleter;
-            final playRequestDispatched = playRequestDispatchCompleter == null
-                ? null
-                : await playRequestDispatchCompleter.future;
-            if (_disposed) {
-          """
-          assert text.count(old_wait) == 1, 'unexpected wait barrier'
+          old_wait = ('    final playRequestGeneration = _playRequestGeneration;\n'
+                      '    final playRequestDispatchCompleter = _playRequestDispatchCompleter;\n'
+                      '    if (playRequestDispatchCompleter != null &&\n'
+                      '        !playRequestDispatchCompleter.isCompleted) {\n'
+                      '      await playRequestDispatchCompleter.future;\n'
+                      '    }\n')
+          new_wait = ('    final playRequestGeneration = _playRequestGeneration;\n'
+                      '    final playRequestDispatchCompleter = _playRequestDispatchCompleter;\n'
+                      '    final playRequestDispatched = playRequestDispatchCompleter == null\n'
+                      '        ? null\n'
+                      '        : await playRequestDispatchCompleter.future;\n')
+          if text.count(old_wait) != 1:
+              raise SystemExit('unexpected wait barrier')
           text = text.replace(old_wait, new_wait, 1)
 
-          wait_anchor = """    if (_playRequestGeneration != playRequestGeneration || !playing) {
-              return const PlaybackStartResult(PlaybackStartStatus.superseded);
-            }
+          guard = ('    if (_playRequestGeneration != playRequestGeneration || !playing) {\n'
+                   '      return const PlaybackStartResult(PlaybackStartStatus.superseded);\n'
+                   '    }\n\n'
+                   '    try {\n')
+          guard_new = ('    if (_playRequestGeneration != playRequestGeneration || !playing) {\n'
+                       '      return const PlaybackStartResult(PlaybackStartStatus.superseded);\n'
+                       '    }\n'
+                       '    if (playRequestDispatched == false) {\n'
+                       '      return const PlaybackStartResult(\n'
+                       '        PlaybackStartStatus.failed,\n'
+                       "        errorMessage: 'Native play request was not dispatched',\n"
+                       '      );\n'
+                       '    }\n\n'
+                       '    try {\n')
+          if text.count(guard) != 1:
+              raise SystemExit('unexpected wait currentness guard')
+          text = text.replace(guard, guard_new, 1)
 
-            try {
-          """
-          wait_new = """    if (_playRequestGeneration != playRequestGeneration || !playing) {
-              return const PlaybackStartResult(PlaybackStartStatus.superseded);
-            }
-            if (playRequestDispatched == false) {
-              return const PlaybackStartResult(
-                PlaybackStartStatus.failed,
-                errorMessage: 'Native play request was not dispatched',
-              );
-            }
-
-            try {
-          """
-          assert text.count(wait_anchor) == 1, 'unexpected wait currentness guard'
-          text = text.replace(wait_anchor, wait_new, 1)
-
-          old_send = """  Future<void> _sendPlayRequest(
-            AudioPlayerPlatform platform,
-            Completer<void>? playCompleter, {
-            Completer<void>? playRequestDispatchCompleter,
-          }) async {
-            try {
-              if (!playing) {
-                _completePlayRequestDispatch(playRequestDispatchCompleter);
-                return;
-              }
-              _completePlayRequestDispatch(playRequestDispatchCompleter);
-              await platform.play(PlayRequest());
-              playCompleter?.complete();
-            } catch (e, stackTrace) {
-              playCompleter?.completeError(e, stackTrace);
-            }
-          }
-          """
-          new_send = """  Future<void> _sendPlayRequest(
+          send_start = text.index('  Future<void> _sendPlayRequest(')
+          send_end = text.index('\n  /// Stops playing audio', send_start)
+          new_send = textwrap.indent(textwrap.dedent('''\
+          Future<void> _sendPlayRequest(
             AudioPlayerPlatform platform,
             Completer<void>? playCompleter, {
             Completer<bool>? playRequestDispatchCompleter,
@@ -336,27 +239,27 @@ jobs:
               playCompleter?.completeError(e, stackTrace);
             }
           }
-          """
-          assert text.count(old_send) == 1, 'unexpected sendPlayRequest implementation'
-          text = text.replace(old_send, new_send, 1)
+          '''), '  ').rstrip()
+          text = text[:send_start] + new_send + text[send_end:]
 
-          old_sig = """    Completer<void>? playCompleter,
-            Completer<void>? playRequestDispatchCompleter,
-            bool force = false,
-          """
-          new_sig = """    Completer<void>? playCompleter,
-            Completer<bool>? playRequestDispatchCompleter,
-            bool force = false,
-          """
-          assert text.count(old_sig) == 1, 'unexpected setPlatformActive signature'
+          old_sig = ('    Completer<void>? playCompleter,\n'
+                     '    Completer<void>? playRequestDispatchCompleter,\n'
+                     '    bool force = false,\n')
+          new_sig = ('    Completer<void>? playCompleter,\n'
+                     '    Completer<bool>? playRequestDispatchCompleter,\n'
+                     '    bool force = false,\n')
+          if text.count(old_sig) != 1:
+              raise SystemExit('unexpected setPlatformActive signature')
           text = text.replace(old_sig, new_sig, 1)
           source.write_text(text)
 
           test = Path('just_audio/test/just_audio_test.dart')
           t = test.read_text()
-          anchor = """  test('playback start acknowledgment rejects without play intent', () async {
-          """
-          new_test = """  test('playback start acknowledgment fails closed without native dispatch',
+          anchor = "  test('playback start acknowledgment rejects without play intent', () async {\n"
+          if t.count(anchor) != 1:
+              raise SystemExit('unexpected playback ack test anchor')
+          new_test = textwrap.indent(textwrap.dedent('''\
+          test('playback start acknowledgment fails closed without native dispatch',
               () async {
             final player = AudioPlayer(handleAudioSessionActivation: false);
 
@@ -372,10 +275,9 @@ jobs:
             await player.dispose();
           });
 
-          test('playback start acknowledgment rejects without play intent', () async {
-          """
-          assert t.count(anchor) == 1, 'unexpected playback ack test anchor'
-          test.write_text(t.replace(anchor, new_test, 1))
+          '''), '  ')
+          t = t.replace(anchor, new_test + anchor, 1)
+          test.write_text(t)
           PY
 
       - uses: subosito/flutter-action@v2
