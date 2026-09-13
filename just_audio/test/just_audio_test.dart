@@ -1699,6 +1699,7 @@ void runTests() {
 
     expect(result.status, PlaybackStartStatus.started);
     expect(result.started, isTrue);
+    expect(platform.playCallCount, greaterThanOrEqualTo(1));
     expect(platform.awaitPlaybackStartCallCount, 1);
     expect(platform.lastPlaybackStartAttemptId, isNotEmpty);
 
@@ -1864,6 +1865,7 @@ class MockAudioPlayer extends AudioPlayerPlatform {
   String? playbackStartErrorMessage;
   int awaitPlaybackStartCallCount = 0;
   String? lastPlaybackStartAttemptId;
+  int playCallCount = 0;
 
   MockAudioPlayer(InitRequest request)
       : audioLoadConfiguration = request.audioLoadConfiguration,
@@ -1958,6 +1960,7 @@ class MockAudioPlayer extends AudioPlayerPlatform {
 
   @override
   Future<PlayResponse> play(PlayRequest request) async {
+    playCallCount++;
     if (_playing) return PlayResponse();
     _playing = true;
     if (_duration != null) {
@@ -1985,7 +1988,9 @@ class MockAudioPlayer extends AudioPlayerPlatform {
     awaitPlaybackStartCallCount++;
     lastPlaybackStartAttemptId = request.attemptId;
     return AwaitPlaybackStartResponse(
-      status: playbackStartStatus,
+      status: playCallCount == 0
+          ? PlaybackStartStatusMessage.rejected
+          : playbackStartStatus,
       errorMessage: playbackStartErrorMessage,
     );
   }

@@ -213,6 +213,8 @@ class AudioPlayer {
   String _webSinkId = '';
   final bool _androidApplyAudioAttributes;
   final bool _handleAudioSessionActivation;
+  int _playRequestGeneration = 0;
+  Completer<void>? _playRequestDispatchCompleter;
 
   /// Counts how many times [_setPlatformActive] is called.
   int _activationCount = 0;
@@ -1117,10 +1119,22 @@ class AudioPlayer {
   ///
   /// This method activates the audio session before playback, and will do
   /// nothing if activation of the audio session fails for any reason.
+  void _completePlayRequestDispatch(Completer<void>? completer) {
+    if (completer != null && !completer.isCompleted) {
+      completer.complete();
+    }
+    if (identical(_playRequestDispatchCompleter, completer)) {
+      _playRequestDispatchCompleter = null;
+    }
+  }
+
   Future<void> play() async {
     if (_disposed) return;
     if (playing) return;
     _playInterrupted = false;
+    final playRequestDispatchCompleter = Completer<void>();
+    _playRequestGeneration++;
+    _playRequestDispatchCompleter = playRequestDispatchCompleter;
     // Broadcast to clients immediately, but revert to false if we fail to
     // activate the audio session. This allows setAudioSource to be aware of a
     // prior play request.
@@ -1132,29 +1146,55 @@ class AudioPlayer {
       ),
     ));
     final playCompleter = Completer<dynamic>();
-    final audioSession = await AudioSession.instance;
-    if (!_handleAudioSessionActivation || await audioSession.setActive(true)) {
-      if (!playing) return;
-      // TODO: rewrite this to more cleanly handle simultaneous load/play
-      // requests which each may result in platform play requests.
-      final requireActive = _playlist.children.isNotEmpty;
-      if (requireActive) {
-        if (_active) {
-          // If the native platform is already active, send it a play request.
-          // NOTE: If a load() request happens simultaneously, this may result
-          // in two play requests being sent. The platform implementation should
-          // ignore the second play request since it is already playing.
-          _sendPlayRequest(await _platform, playCompleter);
-        } else {
-          // If the native platform wasn't already active, activating it will
-          // implicitly restore the playing state and send a play request.
-          _setPlatformActive(true, playCompleter: playCompleter)
-              ?.catchError((dynamic e) async => null);
+    try {
+      final audioSession = await AudioSession.instance;
+      if (!_handleAudioSessionActivation ||
+          await audioSession.setActive(true)) {
+        if (!playing) {
+          _completePlayRequestDispatch(playRequestDispatchCompleter);
+          return;
         }
+        // TODO: rewrite this to more cleanly handle simultaneous load/play
+        // requests which each may result in platform play requests.
+        final requireActive = _playlist.children.isNotEmpty;
+        if (requireActive) {
+          if (_active) {
+            // If the native platform is already active, send it a play request.
+            // NOTE: If a load() request happens simultaneously, this may result
+            // in two play requests being sent. The platform implementation should
+            // ignore the second play request since it is already playing.
+            _sendPlayRequest(
+              await _platform,
+              playCompleter,
+              playRequestDispatchCompleter: playRequestDispatchCompleter,
+            );
+          } else {
+            // If the native platform wasn't already active, activating it will
+            // implicitly restore the playing state and send a play request.
+            final activation = _setPlatformActive(
+              true,
+              playCompleter: playCompleter,
+              playRequestDispatchCompleter: playRequestDispatchCompleter,
+            );
+            if (activation != null) {
+              unawaited(activation.whenComplete(() {
+                _completePlayRequestDispatch(playRequestDispatchCompleter);
+              }).catchError((dynamic e) async => null));
+            } else {
+              _completePlayRequestDispatch(playRequestDispatchCompleter);
+            }
+          }
+        } else {
+          _completePlayRequestDispatch(playRequestDispatchCompleter);
+        }
+      } else {
+        // Revert if we fail to activate the audio session.
+        _playerEventSubject.add(playerEvent.copyWith(playing: false));
+        _completePlayRequestDispatch(playRequestDispatchCompleter);
       }
-    } else {
-      // Revert if we fail to activate the audio session.
-      _playerEventSubject.add(playerEvent.copyWith(playing: false));
+    } catch (_) {
+      _completePlayRequestDispatch(playRequestDispatchCompleter);
+      rethrow;
     }
     await playCompleter.future;
   }
@@ -1164,6 +1204,8 @@ class AudioPlayer {
   Future<void> pause() async {
     if (_disposed) return;
     if (!playing) return;
+    _playRequestGeneration++;
+    _completePlayRequestDispatch(_playRequestDispatchCompleter);
     final stopwatch = Stopwatch();
     stopwatch.start();
     _playInterrupted = false;
@@ -1196,10 +1238,33 @@ class AudioPlayer {
       return const PlaybackStartResult(PlaybackStartStatus.rejected);
     }
 
+    final playRequestGeneration = _playRequestGeneration;
+    final playRequestDispatchCompleter = _playRequestDispatchCompleter;
+    if (playRequestDispatchCompleter != null &&
+        !playRequestDispatchCompleter.isCompleted) {
+      await playRequestDispatchCompleter.future;
+    }
+    if (_disposed) {
+      return const PlaybackStartResult(
+        PlaybackStartStatus.failed,
+        errorMessage: 'Player disposed',
+      );
+    }
+    if (_playRequestGeneration != playRequestGeneration || !playing) {
+      return const PlaybackStartResult(PlaybackStartStatus.superseded);
+    }
+
     try {
       final activation = _setPlatformActive(true);
       if (activation != null) {
         await activation;
+      }
+      if (processingState == ProcessingState.loading) {
+        await Future.any<void>([
+          processingStateStream
+              .firstWhere((state) => state != ProcessingState.loading),
+          playingStream.firstWhere((isPlaying) => !isPlaying),
+        ]);
       }
       if (_disposed) {
         return const PlaybackStartResult(
@@ -1207,7 +1272,7 @@ class AudioPlayer {
           errorMessage: 'Player disposed',
         );
       }
-      if (!playing) {
+      if (_playRequestGeneration != playRequestGeneration || !playing) {
         return const PlaybackStartResult(PlaybackStartStatus.superseded);
       }
       final platform = await _platform;
@@ -1229,9 +1294,16 @@ class AudioPlayer {
   }
 
   Future<void> _sendPlayRequest(
-      AudioPlayerPlatform platform, Completer<void>? playCompleter) async {
+    AudioPlayerPlatform platform,
+    Completer<void>? playCompleter, {
+    Completer<void>? playRequestDispatchCompleter,
+  }) async {
     try {
-      if (!playing) return; // defensive
+      if (!playing) {
+        _completePlayRequestDispatch(playRequestDispatchCompleter);
+        return;
+      }
+      _completePlayRequestDispatch(playRequestDispatchCompleter);
       await platform.play(PlayRequest());
       playCompleter?.complete();
     } catch (e, stackTrace) {
@@ -1249,6 +1321,8 @@ class AudioPlayer {
   /// decoders alive so that the app can quickly resume audio playback.
   Future<void> stop() async {
     if (_disposed) return;
+    _playRequestGeneration++;
+    _completePlayRequestDispatch(_playRequestDispatchCompleter);
     final future =
         _setPlatformActive(false)?.catchError((dynamic e) async => null);
 
@@ -1555,8 +1629,12 @@ class AudioPlayer {
   ///
   /// The platform will not switch if [active] == [_active] unless [force] is
   /// `true`.
-  Future<Duration?>? _setPlatformActive(bool active,
-      {Completer<void>? playCompleter, bool force = false}) {
+  Future<Duration?>? _setPlatformActive(
+    bool active, {
+    Completer<void>? playCompleter,
+    Completer<void>? playRequestDispatchCompleter,
+    bool force = false,
+  }) {
     if (_disposed) return null;
     if (!force && (active == _active)) return _loadFuture;
     _platformLoading = active;
@@ -1835,7 +1913,11 @@ class AudioPlayer {
           if (checkInterruption()) return inactiveResult(platform);
         }
         if (playing) {
-          _sendPlayRequest(platform, playCompleter);
+          _sendPlayRequest(
+            platform,
+            playCompleter,
+            playRequestDispatchCompleter: playRequestDispatchCompleter,
+          );
         }
       }
 
