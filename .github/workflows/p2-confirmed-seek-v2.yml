@@ -1,0 +1,85 @@
+name: P2 confirmed seek v2
+
+on:
+  push:
+    branches:
+      - automation/p2-confirmed-seek
+    paths:
+      - .github/workflows/p2-confirmed-seek-v2.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch-test-android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: automation/p2-confirmed-seek
+          fetch-depth: 0
+      - name: Verify source baseline
+        shell: bash
+        run: |
+          git fetch origin feat/backend-playback-ack
+          test "$(git rev-parse origin/feat/backend-playback-ack)" = "f80ad2ee8a73e5e32a82df20c98666385c6b2aca"
+          test -z "$(git diff --name-only origin/feat/backend-playback-ack...HEAD | grep -v '^\.github/')"
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Resolve package language versions
+        shell: bash
+        run: |
+          (cd just_audio_platform_interface && flutter pub get)
+          (cd just_audio && flutter pub get)
+      - name: Apply confirmed seek contract
+        run: python3 .github/scripts/apply-p2-confirmed-seek-v2.py
+      - name: Format Dart changes
+        run: dart format just_audio/lib/just_audio.dart just_audio/test/just_audio_test.dart just_audio_platform_interface/lib/just_audio_platform_interface.dart just_audio_platform_interface/lib/method_channel_just_audio.dart
+      - name: Platform interface analyze
+        working-directory: just_audio_platform_interface
+        run: flutter analyze
+      - name: just_audio tests and analyze
+        working-directory: just_audio
+        run: |
+          flutter analyze lib test/just_audio_test.dart
+          flutter test test/just_audio_test.dart
+      - name: Android smoke compile
+        working-directory: just_audio/example
+        run: |
+          flutter pub get
+          flutter build apk --debug
+      - name: Enforce source scope
+        shell: bash
+        run: |
+          allowed='^(just_audio/android/src/main/java/com/ryanheise/just_audio/AudioPlayer.java|just_audio/darwin/just_audio/Sources/just_audio/AudioPlayer.m|just_audio/lib/just_audio.dart|just_audio/test/just_audio_test.dart|just_audio_platform_interface/lib/just_audio_platform_interface.dart|just_audio_platform_interface/lib/method_channel_just_audio.dart|.*/pubspec.lock)$'
+          unexpected="$(git diff --name-only | grep -Ev "$allowed" || true)"
+          if [[ -n "$unexpected" ]]; then
+            echo "Unexpected changed paths:"
+            printf '%s\n' "$unexpected"
+            exit 1
+          fi
+          for path in \
+            just_audio/android/src/main/java/com/ryanheise/just_audio/AudioPlayer.java \
+            just_audio/darwin/just_audio/Sources/just_audio/AudioPlayer.m \
+            just_audio/lib/just_audio.dart \
+            just_audio/test/just_audio_test.dart \
+            just_audio_platform_interface/lib/just_audio_platform_interface.dart \
+            just_audio_platform_interface/lib/method_channel_just_audio.dart; do
+            git diff --quiet -- "$path" && { echo "Expected source path unchanged: $path"; exit 1; }
+          done
+      - name: Commit staged implementation
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            just_audio/android/src/main/java/com/ryanheise/just_audio/AudioPlayer.java \
+            just_audio/darwin/just_audio/Sources/just_audio/AudioPlayer.m \
+            just_audio/lib/just_audio.dart \
+            just_audio/test/just_audio_test.dart \
+            just_audio_platform_interface/lib/just_audio_platform_interface.dart \
+            just_audio_platform_interface/lib/method_channel_just_audio.dart
+          git commit -m "feat: expose backend-confirmed seek results"
+          git push origin HEAD:automation/p2-confirmed-seek
