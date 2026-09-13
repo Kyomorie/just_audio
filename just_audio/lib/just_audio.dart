@@ -57,8 +57,26 @@ class PlaybackStartResult {
 
   factory PlaybackStartResult._fromMessage(
       AwaitPlaybackStartResponse response) {
+    late final PlaybackStartStatus status;
+    switch (response.status) {
+      case PlaybackStartStatusMessage.started:
+        status = PlaybackStartStatus.started;
+        break;
+      case PlaybackStartStatusMessage.superseded:
+        status = PlaybackStartStatus.superseded;
+        break;
+      case PlaybackStartStatusMessage.rejected:
+        status = PlaybackStartStatus.rejected;
+        break;
+      case PlaybackStartStatusMessage.failed:
+        status = PlaybackStartStatus.failed;
+        break;
+      case PlaybackStartStatusMessage.unsupported:
+        status = PlaybackStartStatus.unsupported;
+        break;
+    }
     return PlaybackStartResult(
-      PlaybackStartStatus.values[response.status.index],
+      status,
       errorMessage: response.errorMessage,
     );
   }
