@@ -33,17 +33,17 @@ jobs:
         run: |
           python3 <<'PY'
           from pathlib import Path
+          import textwrap
+
           p = Path('just_audio/lib/just_audio.dart')
           text = p.read_text()
-          old = """  factory PlaybackStartResult._fromMessage(
-              AwaitPlaybackStartResponse response) {
-            return PlaybackStartResult(
-              PlaybackStartStatus.values[response.status.index],
-              errorMessage: response.errorMessage,
-            );
-          }
-          """
-          new = """  factory PlaybackStartResult._fromMessage(
+          start = text.index('  factory PlaybackStartResult._fromMessage(')
+          end = text.index('\n  }\n}', start) + len('\n  }')
+          current = text[start:end]
+          if 'PlaybackStartStatus.values[response.status.index]' not in current:
+              raise SystemExit('Ordinal playback status mapping not found in expected factory')
+          replacement = textwrap.indent(textwrap.dedent('''\
+          factory PlaybackStartResult._fromMessage(
               AwaitPlaybackStartResponse response) {
             late final PlaybackStartStatus status;
             switch (response.status) {
@@ -68,10 +68,8 @@ jobs:
               errorMessage: response.errorMessage,
             );
           }
-          """
-          if text.count(old) != 1:
-              raise SystemExit('Unexpected PlaybackStartResult mapping')
-          p.write_text(text.replace(old, new, 1))
+          '''), '  ').rstrip()
+          p.write_text(text[:start] + replacement + text[end:])
           PY
 
       - uses: subosito/flutter-action@v2
@@ -86,7 +84,7 @@ jobs:
           flutter pub get --no-example
           git checkout -- analysis_options.yaml
           dart format lib/just_audio.dart
-          git diff --check
+          git -C .. diff --check
           actual="$(git -C .. diff --name-only | sort)"
           expected='just_audio/lib/just_audio.dart'
           [[ "$actual" == "$expected" ]] || { printf 'Unexpected mapping paths:\n%s\n' "$actual" >&2; exit 1; }
@@ -121,34 +119,21 @@ jobs:
         run: |
           python3 <<'PY'
           from pathlib import Path
+
           p = Path('just_audio/darwin/just_audio/Sources/just_audio/AudioPlayer.m')
           text = p.read_text()
-          old = """- (void)complete {
-              [self updatePosition];
-              _processingState = psCompleted;
-              [self broadcastPlaybackEvent];
-              if (_playResult) {
-                  //NSLog(@\"PLAY FINISHED DUE TO COMPLETE\");
-                  _playResult(@{});
-                  _playResult = nil;
-              }
-          }
-          """
-          new = """- (void)complete {
-              [self updatePosition];
-              _processingState = psCompleted;
-              [self evaluatePlaybackStart];
-              [self broadcastPlaybackEvent];
-              if (_playResult) {
-                  //NSLog(@\"PLAY FINISHED DUE TO COMPLETE\");
-                  _playResult(@{});
-                  _playResult = nil;
-              }
-          }
-          """
-          if text.count(old) != 1:
-              raise SystemExit('Unexpected Darwin complete implementation')
-          p.write_text(text.replace(old, new, 1))
+          start = text.index('- (void)complete {')
+          end = text.index('\n}\n', start) + len('\n}')
+          body = text[start:end]
+          expected = '_processingState = psCompleted;\n    [self broadcastPlaybackEvent];'
+          if body.count(expected) != 1:
+              raise SystemExit('Unexpected Darwin complete ordering')
+          body = body.replace(
+              expected,
+              '_processingState = psCompleted;\n    [self evaluatePlaybackStart];\n    [self broadcastPlaybackEvent];',
+              1,
+          )
+          p.write_text(text[:start] + body + text[end:])
           PY
           git diff --check
           actual="$(git diff --name-only | sort)"
