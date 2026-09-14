@@ -177,6 +177,17 @@ abstract class AudioPlayerPlatform {
     throw UnimplementedError("seek() has not been implemented.");
   }
 
+  /// Seeks and returns only backend-confirmed outcome information. The
+  /// compatibility fallback still performs the seek but cannot prove where the
+  /// backend actually landed.
+  Future<ConfirmedSeekResponse> seekConfirmed(
+      ConfirmedSeekRequest request) async {
+    await seek(SeekRequest(position: request.position, index: request.index));
+    return ConfirmedSeekResponse(
+      status: SeekConfirmationStatusMessage.unsupported,
+    );
+  }
+
   /// On Android, sets the audio attributes, and does nothing on other
   /// platforms.
   Future<SetAndroidAudioAttributesResponse> setAndroidAudioAttributes(
@@ -835,6 +846,65 @@ class SeekRequest {
 /// position and index.
 class SeekResponse {
   static SeekResponse fromMap(Map<dynamic, dynamic> map) => SeekResponse();
+}
+
+/// Backend-confirmed outcome of a seek request.
+enum SeekConfirmationStatusMessage {
+  reached,
+  superseded,
+  rejected,
+  failed,
+  unsupported,
+}
+
+/// Information communicated when requesting a backend-confirmed seek.
+class ConfirmedSeekRequest {
+  final String attemptId;
+  final Duration? position;
+  final int? index;
+
+  ConfirmedSeekRequest({
+    required this.attemptId,
+    this.position,
+    this.index,
+  });
+
+  Map<dynamic, dynamic> toMap() => <dynamic, dynamic>{
+        'attemptId': attemptId,
+        'position': position?.inMicroseconds,
+        'index': index,
+      };
+}
+
+/// Information returned after a backend-confirmed seek request.
+class ConfirmedSeekResponse {
+  final SeekConfirmationStatusMessage status;
+  final Duration? actualPosition;
+  final int? actualIndex;
+  final String? errorMessage;
+
+  ConfirmedSeekResponse({
+    required this.status,
+    this.actualPosition,
+    this.actualIndex,
+    this.errorMessage,
+  });
+
+  static ConfirmedSeekResponse fromMap(Map<dynamic, dynamic> map) {
+    final rawStatus = map['status'] as String?;
+    final status = SeekConfirmationStatusMessage.values.firstWhere(
+      (value) => value.name == rawStatus,
+      orElse: () => SeekConfirmationStatusMessage.failed,
+    );
+    final rawPosition = map['actualPosition'];
+    return ConfirmedSeekResponse(
+      status: status,
+      actualPosition:
+          rawPosition is int ? Duration(microseconds: rawPosition) : null,
+      actualIndex: map['actualIndex'] as int?,
+      errorMessage: map['errorMessage'] as String?,
+    );
+  }
 }
 
 /// Information communicated to the platform implementation when setting the
