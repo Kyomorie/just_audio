@@ -66,6 +66,14 @@ class MethodChannelAudioPlayer extends AudioPlayerPlatform {
   }
 
   @override
+  Future<AwaitPlaybackStartResponse> awaitPlaybackStart(
+      AwaitPlaybackStartRequest request) async {
+    return AwaitPlaybackStartResponse.fromMap(
+        (await _channel.invokeMethod<Map<dynamic, dynamic>>(
+            'awaitPlaybackStart', request.toMap()))!);
+  }
+
+  @override
   Future<PauseResponse> pause(PauseRequest request) async {
     return PauseResponse.fromMap((await _channel
         .invokeMethod<Map<dynamic, dynamic>>('pause', request.toMap()))!);

@@ -40,6 +40,14 @@
     CMTime _seekPos;
     FlutterResult _loadResult;
     FlutterResult _playResult;
+    FlutterResult _playbackStartResult;
+    long long _playbackSourceEpoch;
+    long long _playbackControlEpoch;
+    long long _playbackStartSourceEpoch;
+    long long _playbackStartControlEpoch;
+    int _playbackStartIndex;
+    NSString *_playbackStartAttemptId;
+    BOOL _lastEffectivePlaying;
     id _timeObserver;
     BOOL _automaticallyWaitsToMinimizeStalling;
     BOOL _allowsExternalPlayback;
@@ -89,6 +97,14 @@
     _playing = NO;
     _loadResult = nil;
     _playResult = nil;
+    _playbackStartResult = nil;
+    _playbackSourceEpoch = 0;
+    _playbackControlEpoch = 0;
+    _playbackStartSourceEpoch = 0;
+    _playbackStartControlEpoch = 0;
+    _playbackStartIndex = 0;
+    _playbackStartAttemptId = nil;
+    _lastEffectivePlaying = NO;
     _automaticallyWaitsToMinimizeStalling = YES;
     _allowsExternalPlayback = NO;
     _loadControl = nil;
@@ -131,6 +147,8 @@
             [self load:request[@"audioSource"] initialPosition:initialPosition initialIndex:request[@"initialIndex"] result:result];
         } else if ([@"play" isEqualToString:call.method]) {
             [self play:result];
+        } else if ([@"awaitPlaybackStart" isEqualToString:call.method]) {
+            [self awaitPlaybackStart:(NSString *)request[@"attemptId"] result:result];
         } else if ([@"pause" isEqualToString:call.method]) {
             [self pause];
             result(@{});
@@ -604,6 +622,7 @@
 }
 
 - (void)load:(NSDictionary *)source initialPosition:(CMTime)initialPosition initialIndex:(NSNumber *)initialIndex result:(FlutterResult)result {
+    [self advancePlaybackSourceEpoch];
     if (_playing) {
         [_player pause];
     }
@@ -903,6 +922,7 @@
                     [self broadcastPlaybackEvent];
                     break;
             }
+            [self evaluatePlaybackStart];
         }
     } else if ([keyPath isEqualToString:@"currentItem"] && _player.currentItem) {
         //NSLog(@"currentItem -> [%d]", [self indexForItem:_player.currentItem]);
@@ -921,6 +941,7 @@
                 [self updateEndAction];
                 [self broadcastPlaybackEvent];
             }
+            [self evaluatePlaybackStart];
         }
         //NSLog(@"currentItem changed. _index=%d", _index);
         _bufferUnconfirmed = YES;
@@ -997,6 +1018,7 @@
 }
 
 - (void)sendError:(NSNumber *)errorCode errorMessage:(NSString *)errorMessage playerItem:(IndexedPlayerItem *)playerItem switchToIdle:(BOOL)switchToIdle {
+    [self completePlaybackStart:@"failed" errorMessage:errorMessage];
     //NSLog(@"sendError (%@) %@", errorCode, errorMessage);
     FlutterError *flutterError = [FlutterError errorWithCode:[NSString stringWithFormat:@"%@", errorCode]
                                                      message:errorMessage
@@ -1025,6 +1047,77 @@
         }
     }
     return -1;
+}
+
+- (BOOL)isEffectivelyPlaying {
+    if (!_player || !_playing || _processingState != psReady) return NO;
+    if (@available(macOS 10.12, iOS 10.0, *)) {
+        return _player.timeControlStatus == AVPlayerTimeControlStatusPlaying;
+    }
+    return _player.rate != 0.0f;
+}
+
+- (void)broadcastEffectivePlayingIfChanged {
+    BOOL effectivePlaying = [self isEffectivelyPlaying];
+    if (effectivePlaying == _lastEffectivePlaying) return;
+    _lastEffectivePlaying = effectivePlaying;
+    [_dataEventChannel sendEvent:@{@"effectivePlaying": @(effectivePlaying)}];
+}
+
+- (void)completePlaybackStart:(NSString *)status errorMessage:(NSString *)errorMessage {
+    if (!_playbackStartResult) return;
+    FlutterResult result = _playbackStartResult;
+    _playbackStartResult = nil;
+    _playbackStartAttemptId = nil;
+    result(@{
+        @"status": status,
+        @"errorMessage": errorMessage ?: (id)[NSNull null],
+    });
+}
+
+- (void)advancePlaybackSourceEpoch {
+    _playbackSourceEpoch++;
+    _playbackControlEpoch++;
+    [self completePlaybackStart:@"superseded" errorMessage:nil];
+}
+
+- (void)advancePlaybackControlEpoch {
+    _playbackControlEpoch++;
+    [self completePlaybackStart:@"superseded" errorMessage:nil];
+}
+
+- (void)evaluatePlaybackStart {
+    [self broadcastEffectivePlayingIfChanged];
+    if (!_playbackStartResult) return;
+    if (_playbackStartSourceEpoch != _playbackSourceEpoch
+            || _playbackStartControlEpoch != _playbackControlEpoch
+            || _playbackStartIndex != _index) {
+        [self completePlaybackStart:@"superseded" errorMessage:nil];
+        return;
+    }
+    if (!_player || !_player.currentItem || !_playing
+            || _processingState == psIdle || _processingState == psCompleted) {
+        [self completePlaybackStart:@"rejected" errorMessage:nil];
+        return;
+    }
+    if ([self isEffectivelyPlaying]) {
+        [self completePlaybackStart:@"started" errorMessage:nil];
+    }
+}
+
+- (void)awaitPlaybackStart:(NSString *)attemptId result:(FlutterResult)result {
+    [self completePlaybackStart:@"superseded" errorMessage:nil];
+    if (!_player || !_player.currentItem || !_playing
+            || _processingState == psIdle || _processingState == psCompleted) {
+        result(@{@"status": @"rejected", @"errorMessage": (id)[NSNull null]});
+        return;
+    }
+    _playbackStartResult = result;
+    _playbackStartSourceEpoch = _playbackSourceEpoch;
+    _playbackStartControlEpoch = _playbackControlEpoch;
+    _playbackStartIndex = _index;
+    _playbackStartAttemptId = attemptId;
+    [self evaluatePlaybackStart];
 }
 
 - (void)play {
@@ -1058,9 +1151,14 @@
 }
 
 - (void)pause {
-    if (!_playing) return;
+    [self advancePlaybackControlEpoch];
+    if (!_playing) {
+        [self broadcastEffectivePlayingIfChanged];
+        return;
+    }
     _playing = NO;
     [_player pause];
+    [self broadcastEffectivePlayingIfChanged];
     [self updatePosition];
     [self broadcastPlaybackEvent];
     if (_playResult) {
@@ -1073,6 +1171,7 @@
 - (void)complete {
     [self updatePosition];
     _processingState = psCompleted;
+    [self evaluatePlaybackStart];
     [self broadcastPlaybackEvent];
     if (_playResult) {
         //NSLog(@"PLAY FINISHED DUE TO COMPLETE");
@@ -1206,6 +1305,7 @@
 }
 
 - (void)seek:(CMTime)position index:(NSNumber *)newIndex completionHandler:(void (^)(BOOL))completionHandler {
+    [self advancePlaybackControlEpoch];
     if (_processingState == psIdle || _processingState == psLoading) {
         if (completionHandler) {
             completionHandler(NO);
@@ -1342,6 +1442,7 @@
 }
 
 - (void)dispose:(BOOL)calledFromDealloc {
+    [self advancePlaybackControlEpoch];
     if (!_player) return;
     if (_processingState != psIdle) {
         [_player pause];

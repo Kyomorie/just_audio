@@ -86,6 +86,16 @@ abstract class AudioPlayerPlatform {
     throw UnimplementedError("play() has not been implemented.");
   }
 
+  /// Waits until the backend confirms that the current source is
+  /// effectively playing. Platform implementations that do not provide this
+  /// stronger signal return [PlaybackStartStatusMessage.unsupported].
+  Future<AwaitPlaybackStartResponse> awaitPlaybackStart(
+      AwaitPlaybackStartRequest request) {
+    return Future.value(AwaitPlaybackStartResponse(
+      status: PlaybackStartStatusMessage.unsupported,
+    ));
+  }
+
   /// Pauses playback.
   Future<PauseResponse> pause(PauseRequest request) {
     throw UnimplementedError("pause() has not been implemented.");
@@ -259,6 +269,7 @@ abstract class AudioPlayerPlatform {
 /// will be initiated from the frontend.
 class PlayerDataMessage {
   final bool? playing;
+  final bool? effectivePlaying;
   final double? volume;
   final double? speed;
   final double? pitch;
@@ -269,6 +280,7 @@ class PlayerDataMessage {
 
   PlayerDataMessage({
     this.playing,
+    this.effectivePlaying,
     this.volume,
     this.speed,
     this.pitch,
@@ -279,6 +291,7 @@ class PlayerDataMessage {
   static PlayerDataMessage fromMap(Map<dynamic, dynamic> map) =>
       PlayerDataMessage(
         playing: map['playing'] as bool?,
+        effectivePlaying: map['effectivePlaying'] as bool?,
         volume: map['volume'] as double?,
         speed: map['speed'] as double?,
         pitch: map['pitch'] as double?,
@@ -530,6 +543,49 @@ class PlayRequest {
 /// source.
 class PlayResponse {
   static PlayResponse fromMap(Map<dynamic, dynamic> map) => PlayResponse();
+}
+
+/// Backend-confirmed playback-start state.
+enum PlaybackStartStatusMessage {
+  started,
+  superseded,
+  rejected,
+  failed,
+  unsupported,
+}
+
+/// Information communicated when waiting for backend-confirmed playback.
+class AwaitPlaybackStartRequest {
+  final String attemptId;
+
+  AwaitPlaybackStartRequest({required this.attemptId});
+
+  Map<dynamic, dynamic> toMap() => <dynamic, dynamic>{
+        'attemptId': attemptId,
+      };
+}
+
+/// Information returned after waiting for backend-confirmed playback.
+class AwaitPlaybackStartResponse {
+  final PlaybackStartStatusMessage status;
+  final String? errorMessage;
+
+  AwaitPlaybackStartResponse({
+    required this.status,
+    this.errorMessage,
+  });
+
+  static AwaitPlaybackStartResponse fromMap(Map<dynamic, dynamic> map) {
+    final rawStatus = map['status'] as String?;
+    final status = PlaybackStartStatusMessage.values.firstWhere(
+      (value) => value.name == rawStatus,
+      orElse: () => PlaybackStartStatusMessage.failed,
+    );
+    return AwaitPlaybackStartResponse(
+      status: status,
+      errorMessage: map['errorMessage'] as String?,
+    );
+  }
 }
 
 /// Information communicated to the platform implementation when pausing
