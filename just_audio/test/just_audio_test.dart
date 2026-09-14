@@ -293,6 +293,61 @@ void runTests() {
     await player.dispose();
   });
 
+  test('confirmed seek returns backend-reached position and index', () async {
+    final player = AudioPlayer();
+    await player.setAudioSources([
+      AudioSource.uri(Uri.parse('https://foo.foo/foo.mp3')),
+      AudioSource.uri(Uri.parse('https://bar.bar/bar.mp3')),
+    ]);
+    final platform = mock.mostRecentPlayer!
+      ..confirmedSeekActualPosition = const Duration(seconds: 3)
+      ..confirmedSeekActualIndex = 1;
+
+    final result = await player.seekConfirmed(
+      const Duration(seconds: 2),
+      index: 1,
+    );
+
+    expect(result.status, SeekConfirmationStatus.reached);
+    expect(result.actualPosition, const Duration(seconds: 3));
+    expect(result.actualIndex, 1);
+    expect(platform.confirmedSeekCallCount, 1);
+    await player.dispose();
+  });
+
+  test('confirmed seek rejects while loading without backend call', () async {
+    final player = AudioPlayer();
+    await player.setUrl('https://foo.foo/foo.mp3');
+    final platform = mock.mostRecentPlayer!;
+    platform.blockLoad();
+    final loadFuture = player.setUrl('https://bar.bar/bar.mp3');
+    await player.processingStateStream
+        .firstWhere((state) => state == ProcessingState.loading);
+
+    final result = await player.seekConfirmed(const Duration(seconds: 2));
+
+    expect(result.status, SeekConfirmationStatus.rejected);
+    expect(platform.confirmedSeekCallCount, 0);
+    platform.unblockLoad();
+    await loadFuture;
+    await player.dispose();
+  });
+
+  test('confirmed seek propagates superseded without claiming reach', () async {
+    final player = AudioPlayer();
+    await player.setUrl('https://foo.foo/foo.mp3');
+    final platform = mock.mostRecentPlayer!
+      ..confirmedSeekStatus = SeekConfirmationStatusMessage.superseded;
+
+    final result = await player.seekConfirmed(const Duration(seconds: 2));
+
+    expect(result.status, SeekConfirmationStatus.superseded);
+    expect(result.reached, isFalse);
+    expect(result.actualPosition, isNull);
+    expect(platform.confirmedSeekCallCount, 1);
+    await player.dispose();
+  });
+
   test('speed', () async {
     final player = AudioPlayer();
     /*final duration =*/ await player.setUrl('https://foo.foo/foo.mp3');
@@ -1909,6 +1964,12 @@ class MockAudioPlayer extends AudioPlayerPlatform {
   int awaitPlaybackStartCallCount = 0;
   String? lastPlaybackStartAttemptId;
   int playCallCount = 0;
+  SeekConfirmationStatusMessage confirmedSeekStatus =
+      SeekConfirmationStatusMessage.reached;
+  Duration? confirmedSeekActualPosition;
+  int? confirmedSeekActualIndex;
+  String? confirmedSeekErrorMessage;
+  int confirmedSeekCallCount = 0;
   void Function()? onSetVolume;
 
   MockAudioPlayer(InitRequest request)
@@ -2056,6 +2117,31 @@ class MockAudioPlayer extends AudioPlayerPlatform {
     _index = request.index ?? 0;
     _broadcastPlaybackEvent();
     return SeekResponse();
+  }
+
+  @override
+  Future<ConfirmedSeekResponse> seekConfirmed(
+      ConfirmedSeekRequest request) async {
+    confirmedSeekCallCount++;
+    final actualPosition =
+        confirmedSeekActualPosition ?? request.position ?? Duration.zero;
+    final actualIndex = confirmedSeekActualIndex ?? request.index ?? _index;
+    if (confirmedSeekStatus == SeekConfirmationStatusMessage.reached) {
+      _setPosition(actualPosition);
+      _index = actualIndex;
+      _broadcastPlaybackEvent();
+    }
+    return ConfirmedSeekResponse(
+      status: confirmedSeekStatus,
+      actualPosition:
+          confirmedSeekStatus == SeekConfirmationStatusMessage.reached
+              ? actualPosition
+              : null,
+      actualIndex: confirmedSeekStatus == SeekConfirmationStatusMessage.reached
+          ? actualIndex
+          : null,
+      errorMessage: confirmedSeekErrorMessage,
+    );
   }
 
   Future<void> _autoAdvance() async {
