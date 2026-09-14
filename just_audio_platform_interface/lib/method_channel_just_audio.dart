@@ -170,6 +170,14 @@ class MethodChannelAudioPlayer extends AudioPlayerPlatform {
   }
 
   @override
+  Future<ConfirmedSeekResponse> seekConfirmed(
+      ConfirmedSeekRequest request) async {
+    return ConfirmedSeekResponse.fromMap(
+        (await _channel.invokeMethod<Map<dynamic, dynamic>>(
+            'seekConfirmed', request.toMap()))!);
+  }
+
+  @override
   Future<SetAndroidAudioAttributesResponse> setAndroidAudioAttributes(
       SetAndroidAudioAttributesRequest request) async {
     return SetAndroidAudioAttributesResponse.fromMap(

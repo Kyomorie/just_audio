@@ -82,6 +82,50 @@ class PlaybackStartResult {
   }
 }
 
+/// Result state for a backend-confirmed seek.
+enum SeekConfirmationStatus {
+  reached,
+  superseded,
+  rejected,
+  failed,
+  unsupported,
+}
+
+/// Result of a backend-confirmed seek.
+class SeekConfirmationResult {
+  final SeekConfirmationStatus status;
+  final Duration? actualPosition;
+  final int? actualIndex;
+  final String? errorMessage;
+
+  const SeekConfirmationResult(
+    this.status, {
+    this.actualPosition,
+    this.actualIndex,
+    this.errorMessage,
+  });
+
+  bool get reached => status == SeekConfirmationStatus.reached;
+
+  factory SeekConfirmationResult._fromMessage(ConfirmedSeekResponse response) {
+    final status = switch (response.status) {
+      SeekConfirmationStatusMessage.reached => SeekConfirmationStatus.reached,
+      SeekConfirmationStatusMessage.superseded =>
+        SeekConfirmationStatus.superseded,
+      SeekConfirmationStatusMessage.rejected => SeekConfirmationStatus.rejected,
+      SeekConfirmationStatusMessage.failed => SeekConfirmationStatus.failed,
+      SeekConfirmationStatusMessage.unsupported =>
+        SeekConfirmationStatus.unsupported,
+    };
+    return SeekConfirmationResult(
+      status,
+      actualPosition: response.actualPosition,
+      actualIndex: response.actualIndex,
+      errorMessage: response.errorMessage,
+    );
+  }
+}
+
 /// An audio player that plays a gapless playlist of [AudioSource]s.
 ///
 /// ```
@@ -1577,6 +1621,75 @@ class AudioPlayer {
         } finally {
           _seeking = false;
         }
+    }
+  }
+
+  /// Seeks while requiring the active backend to report where it actually
+  /// landed. This never treats the optimistic Dart position update as proof of
+  /// success. Backends that do not implement confirmation return
+  /// [SeekConfirmationStatus.unsupported].
+  Future<SeekConfirmationResult> seekConfirmed(
+    final Duration? position, {
+    int? index,
+  }) async {
+    if (_disposed) {
+      return const SeekConfirmationResult(
+        SeekConfirmationStatus.failed,
+        errorMessage: 'Player disposed',
+      );
+    }
+    _pluginLoadRequest?.resetInitialSeekValues();
+    if (processingState == ProcessingState.loading ||
+        processingState == ProcessingState.idle) {
+      return const SeekConfirmationResult(SeekConfirmationStatus.rejected);
+    }
+
+    try {
+      _seeking = true;
+      final prevPlaybackEvent = playbackEvent;
+      _playerEventSubject.add(playerEvent.copyWith(
+        playbackEvent: prevPlaybackEvent.copyWith(
+          updatePosition: position,
+          updateTime: DateTime.now(),
+        ),
+      ));
+      _positionDiscontinuitySubject.add(PositionDiscontinuity(
+        PositionDiscontinuityReason.seek,
+        prevPlaybackEvent,
+        playbackEvent,
+      ));
+      final response = await (await _platform).seekConfirmed(
+        ConfirmedSeekRequest(
+          attemptId: _uuid.v4(),
+          position: position,
+          index: index,
+        ),
+      );
+      final result = SeekConfirmationResult._fromMessage(response);
+      if (result.reached && result.actualPosition != null) {
+        _playerEventSubject.add(playerEvent.copyWith(
+          playbackEvent: playbackEvent.copyWith(
+            updatePosition: result.actualPosition,
+            updateTime: DateTime.now(),
+          ),
+        ));
+      }
+      if (playing && !_active) {
+        _setPlatformActive(true)?.catchError((dynamic e) async => null);
+      }
+      return result;
+    } on PlayerInterruptedException catch (error) {
+      return SeekConfirmationResult(
+        SeekConfirmationStatus.superseded,
+        errorMessage: error.message,
+      );
+    } catch (error) {
+      return SeekConfirmationResult(
+        SeekConfirmationStatus.failed,
+        errorMessage: error.toString(),
+      );
+    } finally {
+      _seeking = false;
     }
   }
 
