@@ -91,6 +91,7 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
     private Result prepareResult;
     private Result playResult;
     private Result seekResult;
+    private Result confirmedSeekResult;
     private Map<String, MediaSource> mediaSources = new HashMap<String, MediaSource>();
     private IcyInfo icyInfo;
     private IcyHeaders icyHeaders;
@@ -105,6 +106,14 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
     private Map<String, AudioEffectState> audioEffectStates = new HashMap<String, AudioEffectState>();
     private int lastPlaylistLength = 0;
     private Map<String, Object> pendingPlaybackEvent;
+    private long playbackSourceEpoch = 0L;
+    private long playbackControlEpoch = 0L;
+    private Result playbackStartResult;
+    private long playbackStartSourceEpoch;
+    private long playbackStartControlEpoch;
+    private Integer playbackStartIndex;
+    private String playbackStartAttemptId;
+    private boolean lastEffectivePlaying = false;
 
     private static class AudioEffectState {
         final AudioEffect effect;
@@ -332,8 +341,14 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
         updatePosition();
         switch (reason) {
         case Player.DISCONTINUITY_REASON_AUTO_TRANSITION:
+            updateCurrentIndex();
+            completeConfirmedSeek("superseded", null);
+            break;
         case Player.DISCONTINUITY_REASON_SEEK:
             updateCurrentIndex();
+            if (confirmedSeekResult != null) {
+                completeConfirmedSeekReached(newPosition);
+            }
             break;
         }
         broadcastImmediatePlaybackEvent();
@@ -410,6 +425,8 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
             startWatchingBuffer();
             break;
         case Player.STATE_ENDED:
+            completePlaybackStart("rejected", "Playback completed before start acknowledgment");
+            completeConfirmedSeek("rejected", null);
             if (processingState != ProcessingState.completed) {
                 updatePosition();
                 processingState = ProcessingState.completed;
@@ -437,6 +454,8 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
 
     @Override
     public void onPlayerError(PlaybackException error) {
+        completeConfirmedSeek("failed", error.getMessage());
+        completePlaybackStart("failed", error.getMessage());
         if (error instanceof ExoPlaybackException) {
             final ExoPlaybackException exoError = (ExoPlaybackException)error;
             switch (exoError.type) {
@@ -488,6 +507,9 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
             case "play":
                 play(result);
                 break;
+            case "awaitPlaybackStart":
+                awaitPlaybackStart(call.argument("attemptId"), result);
+                break;
             case "pause":
                 pause();
                 result.success(new HashMap<String, Object>());
@@ -533,6 +555,14 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
                 Long position = getLong(call.argument("position"));
                 Integer index = call.argument("index");
                 seek(position == null ? C.TIME_UNSET : position / 1000, index, result);
+                break;
+            case "seekConfirmed":
+                Long confirmedPosition = getLong(call.argument("position"));
+                Integer confirmedIndex = call.argument("index");
+                seekConfirmed(
+                    confirmedPosition == null ? C.TIME_UNSET : confirmedPosition / 1000,
+                    confirmedIndex,
+                    result);
                 break;
             case "concatenatingInsertAll":
                 if (((String)call.argument("id")).length() == 0) {
@@ -808,6 +838,7 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
     }
 
     private void load(final List<MediaSource> mediaSources, ShuffleOrder shuffleOrder, final long initialPosition, final Integer initialIndex, final Result result) {
+        advancePlaybackSourceEpoch();
         currentIndex = initialIndex != null ? initialIndex : 0;
         switch (processingState) {
         case idle:
@@ -1110,6 +1141,92 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
         return filename.replaceAll("^.*\\.", "").toLowerCase();
     }
 
+    private boolean isEffectivelyPlaying() {
+        return player != null
+            && processingState == ProcessingState.ready
+            && player.isPlaying();
+    }
+
+    private void broadcastEffectivePlayingIfChanged() {
+        final boolean effectivePlaying = isEffectivelyPlaying();
+        if (effectivePlaying == lastEffectivePlaying) return;
+        lastEffectivePlaying = effectivePlaying;
+        dataEventChannel.success(mapOf("effectivePlaying", effectivePlaying));
+    }
+
+    private void completePlaybackStart(String status, String errorMessage) {
+        if (playbackStartResult == null) return;
+        final Result result = playbackStartResult;
+        playbackStartResult = null;
+        playbackStartIndex = null;
+        playbackStartAttemptId = null;
+        result.success(mapOf(
+            "status", status,
+            "errorMessage", errorMessage
+        ));
+    }
+
+    private void advancePlaybackSourceEpoch() {
+        playbackSourceEpoch++;
+        playbackControlEpoch++;
+        completePlaybackStart("superseded", null);
+        completeConfirmedSeek("superseded", null);
+    }
+
+    private void advancePlaybackControlEpoch() {
+        playbackControlEpoch++;
+        completePlaybackStart("superseded", null);
+        completeConfirmedSeek("superseded", null);
+    }
+
+    private void evaluatePlaybackStart() {
+        broadcastEffectivePlayingIfChanged();
+        if (playbackStartResult == null) return;
+        final boolean indexChanged = playbackStartIndex == null
+            ? currentIndex != null
+            : !playbackStartIndex.equals(currentIndex);
+        if (playbackStartSourceEpoch != playbackSourceEpoch
+                || playbackStartControlEpoch != playbackControlEpoch
+                || indexChanged) {
+            completePlaybackStart("superseded", null);
+            return;
+        }
+        if (player == null
+                || player.getMediaItemCount() == 0
+                || !player.getPlayWhenReady()
+                || processingState == ProcessingState.idle
+                || processingState == ProcessingState.completed) {
+            completePlaybackStart("rejected", null);
+            return;
+        }
+        if (isEffectivelyPlaying()) {
+            completePlaybackStart("started", null);
+        }
+    }
+
+    private void awaitPlaybackStart(String attemptId, Result result) {
+        completePlaybackStart("superseded", null);
+        if (player == null
+                || player.getMediaItemCount() == 0
+                || !player.getPlayWhenReady()
+                || processingState == ProcessingState.idle
+                || processingState == ProcessingState.completed) {
+            result.success(mapOf("status", "rejected", "errorMessage", null));
+            return;
+        }
+        playbackStartResult = result;
+        playbackStartSourceEpoch = playbackSourceEpoch;
+        playbackStartControlEpoch = playbackControlEpoch;
+        playbackStartIndex = currentIndex;
+        playbackStartAttemptId = attemptId;
+        evaluatePlaybackStart();
+    }
+
+    @Override
+    public void onIsPlayingChanged(boolean isPlaying) {
+        evaluatePlaybackStart();
+    }
+
     public void play(Result result) {
         if (player.getPlayWhenReady()) {
             result.success(new HashMap<String, Object>());
@@ -1128,8 +1245,13 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
     }
 
     public void pause() {
-        if (!player.getPlayWhenReady()) return;
+        advancePlaybackControlEpoch();
+        if (!player.getPlayWhenReady()) {
+            broadcastEffectivePlayingIfChanged();
+            return;
+        }
         player.setPlayWhenReady(false);
+        broadcastEffectivePlayingIfChanged();
         updatePosition();
         enqueuePlaybackEvent();
         if (playResult != null) {
@@ -1170,7 +1292,63 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
         player.setShuffleModeEnabled(enabled);
     }
 
+    public void seekConfirmed(
+            final long position,
+            final Integer index,
+            final Result result) {
+        advancePlaybackControlEpoch();
+        if (position == C.TIME_UNSET ||
+                player == null ||
+                player.getMediaItemCount() == 0 ||
+                processingState == ProcessingState.idle ||
+                processingState == ProcessingState.loading) {
+            Map<String, Object> response = new HashMap<>();
+            response.put("status", "rejected");
+            result.success(response);
+            return;
+        }
+        abortSeek();
+        confirmedSeekResult = result;
+        seekPos = position;
+        try {
+            int windowIndex = index != null ? index : player.getCurrentMediaItemIndex();
+            if (windowIndex < 0 || windowIndex >= player.getMediaItemCount()) {
+                completeConfirmedSeek("rejected", null);
+                return;
+            }
+            player.seekTo(windowIndex, position);
+        } catch (RuntimeException e) {
+            completeConfirmedSeek("failed", e.getMessage());
+        }
+    }
+
+    private void completeConfirmedSeekReached(PositionInfo newPosition) {
+        Result result = confirmedSeekResult;
+        if (result == null) return;
+        confirmedSeekResult = null;
+        seekPos = null;
+        result.success(mapOf(
+            "status", "reached",
+            "actualPosition", 1000L * newPosition.positionMs,
+            "actualIndex", newPosition.mediaItemIndex
+        ));
+    }
+
+    private void completeConfirmedSeek(String status, String errorMessage) {
+        Result result = confirmedSeekResult;
+        if (result == null) return;
+        confirmedSeekResult = null;
+        seekPos = null;
+        Map<String, Object> response = new HashMap<>();
+        response.put("status", status);
+        if (errorMessage != null) {
+            response.put("errorMessage", errorMessage);
+        }
+        result.success(response);
+    }
+
     public void seek(final long position, final Integer index, final Result result) {
+        advancePlaybackControlEpoch();
         if (processingState == ProcessingState.idle || processingState == ProcessingState.loading) {
             result.success(new HashMap<String, Object>());
             return;
@@ -1189,6 +1367,7 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
     }
 
     public void dispose() {
+        advancePlaybackControlEpoch();
         if (processingState == ProcessingState.loading) {
             abortExistingConnection(true);
         }

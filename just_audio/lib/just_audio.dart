@@ -37,6 +37,95 @@ JustAudioPlatform get _pluginPlatform {
   return pluginPlatform;
 }
 
+/// Result of waiting for backend-confirmed effective playback.
+enum PlaybackStartStatus {
+  started,
+  superseded,
+  rejected,
+  failed,
+  unsupported,
+}
+
+/// A backend-confirmed playback-start result.
+class PlaybackStartResult {
+  final PlaybackStartStatus status;
+  final String? errorMessage;
+
+  const PlaybackStartResult(this.status, {this.errorMessage});
+
+  bool get started => status == PlaybackStartStatus.started;
+
+  factory PlaybackStartResult._fromMessage(
+      AwaitPlaybackStartResponse response) {
+    late final PlaybackStartStatus status;
+    switch (response.status) {
+      case PlaybackStartStatusMessage.started:
+        status = PlaybackStartStatus.started;
+        break;
+      case PlaybackStartStatusMessage.superseded:
+        status = PlaybackStartStatus.superseded;
+        break;
+      case PlaybackStartStatusMessage.rejected:
+        status = PlaybackStartStatus.rejected;
+        break;
+      case PlaybackStartStatusMessage.failed:
+        status = PlaybackStartStatus.failed;
+        break;
+      case PlaybackStartStatusMessage.unsupported:
+        status = PlaybackStartStatus.unsupported;
+        break;
+    }
+    return PlaybackStartResult(
+      status,
+      errorMessage: response.errorMessage,
+    );
+  }
+}
+
+/// Result state for a backend-confirmed seek.
+enum SeekConfirmationStatus {
+  reached,
+  superseded,
+  rejected,
+  failed,
+  unsupported,
+}
+
+/// Result of a backend-confirmed seek.
+class SeekConfirmationResult {
+  final SeekConfirmationStatus status;
+  final Duration? actualPosition;
+  final int? actualIndex;
+  final String? errorMessage;
+
+  const SeekConfirmationResult(
+    this.status, {
+    this.actualPosition,
+    this.actualIndex,
+    this.errorMessage,
+  });
+
+  bool get reached => status == SeekConfirmationStatus.reached;
+
+  factory SeekConfirmationResult._fromMessage(ConfirmedSeekResponse response) {
+    final status = switch (response.status) {
+      SeekConfirmationStatusMessage.reached => SeekConfirmationStatus.reached,
+      SeekConfirmationStatusMessage.superseded =>
+        SeekConfirmationStatus.superseded,
+      SeekConfirmationStatusMessage.rejected => SeekConfirmationStatus.rejected,
+      SeekConfirmationStatusMessage.failed => SeekConfirmationStatus.failed,
+      SeekConfirmationStatusMessage.unsupported =>
+        SeekConfirmationStatus.unsupported,
+    };
+    return SeekConfirmationResult(
+      status,
+      actualPosition: response.actualPosition,
+      actualIndex: response.actualIndex,
+      errorMessage: response.errorMessage,
+    );
+  }
+}
+
 /// An audio player that plays a gapless playlist of [AudioSource]s.
 ///
 /// ```
@@ -143,6 +232,7 @@ class AudioPlayer {
 
   // independent streams
   final _playingSubject = BehaviorSubject.seeded(false);
+  final _effectivePlayingSubject = BehaviorSubject.seeded(false);
   final _volumeSubject = BehaviorSubject.seeded(1.0);
   final _speedSubject = BehaviorSubject.seeded(1.0);
   final _pitchSubject = BehaviorSubject.seeded(1.0);
@@ -185,6 +275,8 @@ class AudioPlayer {
   String _webSinkId = '';
   final bool _androidApplyAudioAttributes;
   final bool _handleAudioSessionActivation;
+  int _playRequestGeneration = 0;
+  Completer<bool>? _playRequestDispatchCompleter;
 
   /// Counts how many times [_setPlatformActive] is called.
   int _activationCount = 0;
@@ -491,6 +583,16 @@ class AudioPlayer {
 
   /// A stream of changing [playing] states.
   Stream<bool> get playingStream => _playingSubject.stream.distinct();
+
+  /// Whether the backend is currently rendering the active source.
+  ///
+  /// Unlike [playing], this is not playback intent. It is confirmed by the
+  /// backend and becomes false while playback is not effectively running.
+  bool get effectivePlaying => _effectivePlayingSubject.nvalue!;
+
+  /// A stream of backend-confirmed effective playback changes.
+  Stream<bool> get effectivePlayingStream =>
+      _effectivePlayingSubject.stream.distinct();
 
   /// The current volume of the player.
   double get volume => _volumeSubject.nvalue!;
@@ -1079,10 +1181,22 @@ class AudioPlayer {
   ///
   /// This method activates the audio session before playback, and will do
   /// nothing if activation of the audio session fails for any reason.
+  void _completePlayRequestDispatch(
+    Completer<bool>? completer, {
+    required bool dispatched,
+  }) {
+    if (completer != null && !completer.isCompleted) {
+      completer.complete(dispatched);
+    }
+  }
+
   Future<void> play() async {
     if (_disposed) return;
     if (playing) return;
     _playInterrupted = false;
+    final playRequestDispatchCompleter = Completer<bool>();
+    _playRequestGeneration++;
+    _playRequestDispatchCompleter = playRequestDispatchCompleter;
     // Broadcast to clients immediately, but revert to false if we fail to
     // activate the audio session. This allows setAudioSource to be aware of a
     // prior play request.
@@ -1094,29 +1208,91 @@ class AudioPlayer {
       ),
     ));
     final playCompleter = Completer<dynamic>();
-    final audioSession = await AudioSession.instance;
-    if (!_handleAudioSessionActivation || await audioSession.setActive(true)) {
-      if (!playing) return;
-      // TODO: rewrite this to more cleanly handle simultaneous load/play
-      // requests which each may result in platform play requests.
-      final requireActive = _playlist.children.isNotEmpty;
-      if (requireActive) {
-        if (_active) {
-          // If the native platform is already active, send it a play request.
-          // NOTE: If a load() request happens simultaneously, this may result
-          // in two play requests being sent. The platform implementation should
-          // ignore the second play request since it is already playing.
-          _sendPlayRequest(await _platform, playCompleter);
-        } else {
-          // If the native platform wasn't already active, activating it will
-          // implicitly restore the playing state and send a play request.
-          _setPlatformActive(true, playCompleter: playCompleter)
-              ?.catchError((dynamic e) async => null);
+    try {
+      final audioSession = await AudioSession.instance;
+      if (!_handleAudioSessionActivation ||
+          await audioSession.setActive(true)) {
+        if (!playing) {
+          _completePlayRequestDispatch(
+            playRequestDispatchCompleter,
+            dispatched: false,
+          );
+          if (!playCompleter.isCompleted) playCompleter.complete();
+          return;
         }
+        // TODO: rewrite this to more cleanly handle simultaneous load/play
+        // requests which each may result in platform play requests.
+        final requireActive = _playlist.children.isNotEmpty;
+        if (requireActive) {
+          if (_active) {
+            // If the native platform is already active, send it a play request.
+            // NOTE: If a load() request happens simultaneously, this may result
+            // in two play requests being sent. The platform implementation should
+            // ignore the second play request since it is already playing.
+            _sendPlayRequest(
+              await _platform,
+              playCompleter,
+              playRequestDispatchCompleter: playRequestDispatchCompleter,
+            );
+          } else {
+            // If the native platform wasn't already active, activating it will
+            // implicitly restore the playing state and send a play request.
+            final activation = _setPlatformActive(
+              true,
+              playCompleter: playCompleter,
+              playRequestDispatchCompleter: playRequestDispatchCompleter,
+            );
+            if (activation != null) {
+              unawaited(activation.then<void>(
+                (_) {
+                  if (!playRequestDispatchCompleter.isCompleted) {
+                    _completePlayRequestDispatch(
+                      playRequestDispatchCompleter,
+                      dispatched: false,
+                    );
+                    if (!playCompleter.isCompleted) playCompleter.complete();
+                  }
+                },
+                onError: (Object error, StackTrace stackTrace) {
+                  _completePlayRequestDispatch(
+                    playRequestDispatchCompleter,
+                    dispatched: false,
+                  );
+                  if (!playCompleter.isCompleted) {
+                    playCompleter.completeError(error, stackTrace);
+                  }
+                },
+              ));
+            } else {
+              _completePlayRequestDispatch(
+                playRequestDispatchCompleter,
+                dispatched: false,
+              );
+              if (!playCompleter.isCompleted) playCompleter.complete();
+            }
+          }
+        } else {
+          _completePlayRequestDispatch(
+            playRequestDispatchCompleter,
+            dispatched: false,
+          );
+          if (!playCompleter.isCompleted) playCompleter.complete();
+        }
+      } else {
+        // Revert if we fail to activate the audio session.
+        _playerEventSubject.add(playerEvent.copyWith(playing: false));
+        _completePlayRequestDispatch(
+          playRequestDispatchCompleter,
+          dispatched: false,
+        );
+        if (!playCompleter.isCompleted) playCompleter.complete();
       }
-    } else {
-      // Revert if we fail to activate the audio session.
-      _playerEventSubject.add(playerEvent.copyWith(playing: false));
+    } catch (_) {
+      _completePlayRequestDispatch(
+        playRequestDispatchCompleter,
+        dispatched: false,
+      );
+      rethrow;
     }
     await playCompleter.future;
   }
@@ -1126,6 +1302,11 @@ class AudioPlayer {
   Future<void> pause() async {
     if (_disposed) return;
     if (!playing) return;
+    _playRequestGeneration++;
+    _completePlayRequestDispatch(
+      _playRequestDispatchCompleter,
+      dispatched: false,
+    );
     final stopwatch = Stopwatch();
     stopwatch.start();
     _playInterrupted = false;
@@ -1144,14 +1325,116 @@ class AudioPlayer {
     await (await _platform).pause(PauseRequest());
   }
 
-  Future<void> _sendPlayRequest(
-      AudioPlayerPlatform platform, Completer<void>? playCompleter) async {
+  /// Waits for the native backend to confirm effective playback for
+  /// the currently loaded source. This does not infer success from [playing],
+  /// audio-session activation, elapsed time, or position movement.
+  Future<PlaybackStartResult> waitForPlaybackStart() async {
+    if (_disposed) {
+      return const PlaybackStartResult(
+        PlaybackStartStatus.failed,
+        errorMessage: 'Player disposed',
+      );
+    }
+    if (!playing) {
+      return const PlaybackStartResult(PlaybackStartStatus.rejected);
+    }
+
+    final playRequestGeneration = _playRequestGeneration;
+    final playRequestDispatchCompleter = _playRequestDispatchCompleter;
+    final playRequestDispatched = playRequestDispatchCompleter == null
+        ? null
+        : await playRequestDispatchCompleter.future;
+    if (_disposed) {
+      return const PlaybackStartResult(
+        PlaybackStartStatus.failed,
+        errorMessage: 'Player disposed',
+      );
+    }
+    if (_playRequestGeneration != playRequestGeneration || !playing) {
+      return const PlaybackStartResult(PlaybackStartStatus.superseded);
+    }
+    if (playRequestDispatched == false) {
+      return const PlaybackStartResult(
+        PlaybackStartStatus.failed,
+        errorMessage: 'Native play request was not dispatched',
+      );
+    }
+
     try {
-      if (!playing) return; // defensive
-      await platform.play(PlayRequest());
-      playCompleter?.complete();
+      final activation = _setPlatformActive(true);
+      if (activation != null) {
+        await activation;
+      }
+      if (processingState == ProcessingState.loading) {
+        await Future.any<void>([
+          processingStateStream
+              .firstWhere((state) => state != ProcessingState.loading),
+          playingStream.firstWhere((isPlaying) => !isPlaying),
+        ]);
+      }
+      if (_disposed) {
+        return const PlaybackStartResult(
+          PlaybackStartStatus.failed,
+          errorMessage: 'Player disposed',
+        );
+      }
+      if (_playRequestGeneration != playRequestGeneration || !playing) {
+        return const PlaybackStartResult(PlaybackStartStatus.superseded);
+      }
+      final platform = await _platform;
+      final response = await platform.awaitPlaybackStart(
+        AwaitPlaybackStartRequest(attemptId: _uuid.v4()),
+      );
+      return PlaybackStartResult._fromMessage(response);
+    } on PlayerInterruptedException catch (error) {
+      return PlaybackStartResult(
+        PlaybackStartStatus.superseded,
+        errorMessage: error.message,
+      );
+    } catch (error) {
+      return PlaybackStartResult(
+        PlaybackStartStatus.failed,
+        errorMessage: error.toString(),
+      );
+    }
+  }
+
+  Future<void> _sendPlayRequest(
+    AudioPlayerPlatform platform,
+    Completer<void>? playCompleter, {
+    Completer<bool>? playRequestDispatchCompleter,
+  }) async {
+    try {
+      if (!playing) {
+        _completePlayRequestDispatch(
+          playRequestDispatchCompleter,
+          dispatched: false,
+        );
+        if (playCompleter != null && !playCompleter.isCompleted) {
+          playCompleter.complete();
+        }
+        return;
+      }
+      final playFuture = platform.play(PlayRequest());
+      _completePlayRequestDispatch(
+        playRequestDispatchCompleter,
+        dispatched: true,
+      );
+      await playFuture;
+      if (playCompleter != null && !playCompleter.isCompleted) {
+        playCompleter.complete();
+      }
     } catch (e, stackTrace) {
-      playCompleter?.completeError(e, stackTrace);
+      if (playRequestDispatchCompleter != null &&
+          !playRequestDispatchCompleter.isCompleted) {
+        _completePlayRequestDispatch(
+          playRequestDispatchCompleter,
+          dispatched: false,
+        );
+      }
+      if (playCompleter != null && !playCompleter.isCompleted) {
+        playCompleter.completeError(e, stackTrace);
+      }
     }
   }
 
@@ -1165,6 +1448,11 @@ class AudioPlayer {
   /// decoders alive so that the app can quickly resume audio playback.
   Future<void> stop() async {
     if (_disposed) return;
+    _playRequestGeneration++;
+    _completePlayRequestDispatch(
+      _playRequestDispatchCompleter,
+      dispatched: false,
+    );
     final future =
         _setPlatformActive(false)?.catchError((dynamic e) async => null);
 
@@ -1336,6 +1624,75 @@ class AudioPlayer {
     }
   }
 
+  /// Seeks while requiring the active backend to report where it actually
+  /// landed. This never treats the optimistic Dart position update as proof of
+  /// success. Backends that do not implement confirmation return
+  /// [SeekConfirmationStatus.unsupported].
+  Future<SeekConfirmationResult> seekConfirmed(
+    final Duration? position, {
+    int? index,
+  }) async {
+    if (_disposed) {
+      return const SeekConfirmationResult(
+        SeekConfirmationStatus.failed,
+        errorMessage: 'Player disposed',
+      );
+    }
+    _pluginLoadRequest?.resetInitialSeekValues();
+    if (processingState == ProcessingState.loading ||
+        processingState == ProcessingState.idle) {
+      return const SeekConfirmationResult(SeekConfirmationStatus.rejected);
+    }
+
+    try {
+      _seeking = true;
+      final prevPlaybackEvent = playbackEvent;
+      _playerEventSubject.add(playerEvent.copyWith(
+        playbackEvent: prevPlaybackEvent.copyWith(
+          updatePosition: position,
+          updateTime: DateTime.now(),
+        ),
+      ));
+      _positionDiscontinuitySubject.add(PositionDiscontinuity(
+        PositionDiscontinuityReason.seek,
+        prevPlaybackEvent,
+        playbackEvent,
+      ));
+      final response = await (await _platform).seekConfirmed(
+        ConfirmedSeekRequest(
+          attemptId: _uuid.v4(),
+          position: position,
+          index: index,
+        ),
+      );
+      final result = SeekConfirmationResult._fromMessage(response);
+      if (result.reached && result.actualPosition != null) {
+        _playerEventSubject.add(playerEvent.copyWith(
+          playbackEvent: playbackEvent.copyWith(
+            updatePosition: result.actualPosition,
+            updateTime: DateTime.now(),
+          ),
+        ));
+      }
+      if (playing && !_active) {
+        _setPlatformActive(true)?.catchError((dynamic e) async => null);
+      }
+      return result;
+    } on PlayerInterruptedException catch (error) {
+      return SeekConfirmationResult(
+        SeekConfirmationStatus.superseded,
+        errorMessage: error.message,
+      );
+    } catch (error) {
+      return SeekConfirmationResult(
+        SeekConfirmationStatus.failed,
+        errorMessage: error.toString(),
+      );
+    } finally {
+      _seeking = false;
+    }
+  }
+
   /// Seeks to the next item, or does nothing if there is no next item.
   Future<void> seekToNext() async {
     if (hasNext) {
@@ -1441,6 +1798,7 @@ class AudioPlayer {
       await _playbackEventSubject.close();
       await _sequenceStateSubject.close();
       await _playingSubject.close();
+      await _effectivePlayingSubject.close();
       await _volumeSubject.close();
       await _speedSubject.close();
       await _pitchSubject.close();
@@ -1470,8 +1828,12 @@ class AudioPlayer {
   ///
   /// The platform will not switch if [active] == [_active] unless [force] is
   /// `true`.
-  Future<Duration?>? _setPlatformActive(bool active,
-      {Completer<void>? playCompleter, bool force = false}) {
+  Future<Duration?>? _setPlatformActive(
+    bool active, {
+    Completer<void>? playCompleter,
+    Completer<bool>? playRequestDispatchCompleter,
+    bool force = false,
+  }) {
     if (_disposed) return null;
     if (!force && (active == _active)) return _loadFuture;
     _platformLoading = active;
@@ -1518,6 +1880,9 @@ class AudioPlayer {
     // This method updates _active and _platform before yielding to the next
     // task in the event loop.
     _active = active;
+    if (!active && effectivePlaying) {
+      _effectivePlayingSubject.add(false);
+    }
     final position = this.position;
     final currentIndex = this.currentIndex;
     final playlist = _playlist;
@@ -1528,6 +1893,10 @@ class AudioPlayer {
         if (message.playing != null && message.playing != playing) {
           _playerEventSubject
               .add(playerEvent.copyWith(playing: message.playing!));
+        }
+        if (message.effectivePlaying != null &&
+            message.effectivePlaying != effectivePlaying) {
+          _effectivePlayingSubject.add(message.effectivePlaying!);
         }
         if (message.volume != null) {
           _volumeSubject.add(message.volume!);
@@ -1743,7 +2112,11 @@ class AudioPlayer {
           if (checkInterruption()) return inactiveResult(platform);
         }
         if (playing) {
-          _sendPlayRequest(platform, playCompleter);
+          _sendPlayRequest(
+            platform,
+            playCompleter,
+            playRequestDispatchCompleter: playRequestDispatchCompleter,
+          );
         }
       }
 

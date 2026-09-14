@@ -40,6 +40,19 @@
     CMTime _seekPos;
     FlutterResult _loadResult;
     FlutterResult _playResult;
+    FlutterResult _playbackStartResult;
+    FlutterResult _confirmedSeekResult;
+    long long _confirmedSeekSourceEpoch;
+    long long _confirmedSeekControlEpoch;
+    int _confirmedSeekIndex;
+    NSString *_confirmedSeekAttemptId;
+    long long _playbackSourceEpoch;
+    long long _playbackControlEpoch;
+    long long _playbackStartSourceEpoch;
+    long long _playbackStartControlEpoch;
+    int _playbackStartIndex;
+    NSString *_playbackStartAttemptId;
+    BOOL _lastEffectivePlaying;
     id _timeObserver;
     BOOL _automaticallyWaitsToMinimizeStalling;
     BOOL _allowsExternalPlayback;
@@ -89,6 +102,19 @@
     _playing = NO;
     _loadResult = nil;
     _playResult = nil;
+    _playbackStartResult = nil;
+    _confirmedSeekResult = nil;
+    _confirmedSeekSourceEpoch = 0;
+    _confirmedSeekControlEpoch = 0;
+    _confirmedSeekIndex = 0;
+    _confirmedSeekAttemptId = nil;
+    _playbackSourceEpoch = 0;
+    _playbackControlEpoch = 0;
+    _playbackStartSourceEpoch = 0;
+    _playbackStartControlEpoch = 0;
+    _playbackStartIndex = 0;
+    _playbackStartAttemptId = nil;
+    _lastEffectivePlaying = NO;
     _automaticallyWaitsToMinimizeStalling = YES;
     _allowsExternalPlayback = NO;
     _loadControl = nil;
@@ -131,6 +157,8 @@
             [self load:request[@"audioSource"] initialPosition:initialPosition initialIndex:request[@"initialIndex"] result:result];
         } else if ([@"play" isEqualToString:call.method]) {
             [self play:result];
+        } else if ([@"awaitPlaybackStart" isEqualToString:call.method]) {
+            [self awaitPlaybackStart:(NSString *)request[@"attemptId"] result:result];
         } else if ([@"pause" isEqualToString:call.method]) {
             [self pause];
             result(@{});
@@ -169,6 +197,14 @@
             [self seek:position index:request[@"index"] completionHandler:^(BOOL finished) {
                 result(@{});
             }];
+        } else if ([@"seekConfirmed" isEqualToString:call.method]) {
+            CMTime position = request[@"position"] == (id)[NSNull null]
+                ? kCMTimeInvalid
+                : CMTimeMake([request[@"position"] longLongValue], 1000000);
+            [self seekConfirmed:position
+                          index:request[@"index"]
+                      attemptId:(NSString *)request[@"attemptId"]
+                         result:result];
         } else if ([@"concatenatingInsertAll" isEqualToString:call.method]) {
             [self concatenatingInsertAll:(NSString *)request[@"id"] index:[request[@"index"] intValue] sources:(NSArray *)request[@"children"] shuffleOrder:(NSArray<NSNumber *> *)request[@"shuffleOrder"]];
             result(@{});
@@ -604,6 +640,7 @@
 }
 
 - (void)load:(NSDictionary *)source initialPosition:(CMTime)initialPosition initialIndex:(NSNumber *)initialIndex result:(FlutterResult)result {
+    [self advancePlaybackSourceEpoch];
     if (_playing) {
         [_player pause];
     }
@@ -903,6 +940,7 @@
                     [self broadcastPlaybackEvent];
                     break;
             }
+            [self evaluatePlaybackStart];
         }
     } else if ([keyPath isEqualToString:@"currentItem"] && _player.currentItem) {
         //NSLog(@"currentItem -> [%d]", [self indexForItem:_player.currentItem]);
@@ -921,6 +959,7 @@
                 [self updateEndAction];
                 [self broadcastPlaybackEvent];
             }
+            [self evaluatePlaybackStart];
         }
         //NSLog(@"currentItem changed. _index=%d", _index);
         _bufferUnconfirmed = YES;
@@ -997,6 +1036,8 @@
 }
 
 - (void)sendError:(NSNumber *)errorCode errorMessage:(NSString *)errorMessage playerItem:(IndexedPlayerItem *)playerItem switchToIdle:(BOOL)switchToIdle {
+    [self completeConfirmedSeek:@"failed" errorMessage:errorMessage includeActualPosition:NO];
+    [self completePlaybackStart:@"failed" errorMessage:errorMessage];
     //NSLog(@"sendError (%@) %@", errorCode, errorMessage);
     FlutterError *flutterError = [FlutterError errorWithCode:[NSString stringWithFormat:@"%@", errorCode]
                                                      message:errorMessage
@@ -1025,6 +1066,95 @@
         }
     }
     return -1;
+}
+
+- (BOOL)isEffectivelyPlaying {
+    if (!_player || !_playing || _processingState != psReady) return NO;
+    if (@available(macOS 10.12, iOS 10.0, *)) {
+        return _player.timeControlStatus == AVPlayerTimeControlStatusPlaying;
+    }
+    return _player.rate != 0.0f;
+}
+
+- (void)broadcastEffectivePlayingIfChanged {
+    BOOL effectivePlaying = [self isEffectivelyPlaying];
+    if (effectivePlaying == _lastEffectivePlaying) return;
+    _lastEffectivePlaying = effectivePlaying;
+    [_dataEventChannel sendEvent:@{@"effectivePlaying": @(effectivePlaying)}];
+}
+
+- (void)completePlaybackStart:(NSString *)status errorMessage:(NSString *)errorMessage {
+    if (!_playbackStartResult) return;
+    FlutterResult result = _playbackStartResult;
+    _playbackStartResult = nil;
+    _playbackStartAttemptId = nil;
+    result(@{
+        @"status": status,
+        @"errorMessage": errorMessage ?: (id)[NSNull null],
+    });
+}
+
+- (void)completeConfirmedSeek:(NSString *)status errorMessage:(NSString *)errorMessage includeActualPosition:(BOOL)includeActualPosition {
+    if (!_confirmedSeekResult) return;
+    FlutterResult result = _confirmedSeekResult;
+    _confirmedSeekResult = nil;
+    _confirmedSeekAttemptId = nil;
+    NSMutableDictionary *response = [NSMutableDictionary dictionaryWithObject:status forKey:@"status"];
+    if (includeActualPosition) {
+        response[@"actualPosition"] = @((long long)[self getCurrentPosition] * 1000LL);
+        response[@"actualIndex"] = @(_index);
+    }
+    if (errorMessage) {
+        response[@"errorMessage"] = errorMessage;
+    }
+    result(response);
+}
+
+- (void)advancePlaybackSourceEpoch {
+    _playbackSourceEpoch++;
+    _playbackControlEpoch++;
+    [self completePlaybackStart:@"superseded" errorMessage:nil];
+    [self completeConfirmedSeek:@"superseded" errorMessage:nil includeActualPosition:NO];
+}
+
+- (void)advancePlaybackControlEpoch {
+    _playbackControlEpoch++;
+    [self completePlaybackStart:@"superseded" errorMessage:nil];
+    [self completeConfirmedSeek:@"superseded" errorMessage:nil includeActualPosition:NO];
+}
+
+- (void)evaluatePlaybackStart {
+    [self broadcastEffectivePlayingIfChanged];
+    if (!_playbackStartResult) return;
+    if (_playbackStartSourceEpoch != _playbackSourceEpoch
+            || _playbackStartControlEpoch != _playbackControlEpoch
+            || _playbackStartIndex != _index) {
+        [self completePlaybackStart:@"superseded" errorMessage:nil];
+        return;
+    }
+    if (!_player || !_player.currentItem || !_playing
+            || _processingState == psIdle || _processingState == psCompleted) {
+        [self completePlaybackStart:@"rejected" errorMessage:nil];
+        return;
+    }
+    if ([self isEffectivelyPlaying]) {
+        [self completePlaybackStart:@"started" errorMessage:nil];
+    }
+}
+
+- (void)awaitPlaybackStart:(NSString *)attemptId result:(FlutterResult)result {
+    [self completePlaybackStart:@"superseded" errorMessage:nil];
+    if (!_player || !_player.currentItem || !_playing
+            || _processingState == psIdle || _processingState == psCompleted) {
+        result(@{@"status": @"rejected", @"errorMessage": (id)[NSNull null]});
+        return;
+    }
+    _playbackStartResult = result;
+    _playbackStartSourceEpoch = _playbackSourceEpoch;
+    _playbackStartControlEpoch = _playbackControlEpoch;
+    _playbackStartIndex = _index;
+    _playbackStartAttemptId = attemptId;
+    [self evaluatePlaybackStart];
 }
 
 - (void)play {
@@ -1058,9 +1188,14 @@
 }
 
 - (void)pause {
-    if (!_playing) return;
+    [self advancePlaybackControlEpoch];
+    if (!_playing) {
+        [self broadcastEffectivePlayingIfChanged];
+        return;
+    }
     _playing = NO;
     [_player pause];
+    [self broadcastEffectivePlayingIfChanged];
     [self updatePosition];
     [self broadcastPlaybackEvent];
     if (_playResult) {
@@ -1073,6 +1208,8 @@
 - (void)complete {
     [self updatePosition];
     _processingState = psCompleted;
+    [self completeConfirmedSeek:@"rejected" errorMessage:nil includeActualPosition:NO];
+    [self evaluatePlaybackStart];
     [self broadcastPlaybackEvent];
     if (_playResult) {
         //NSLog(@"PLAY FINISHED DUE TO COMPLETE");
@@ -1205,7 +1342,56 @@
     }
 }
 
+- (void)seekConfirmed:(CMTime)position
+                   index:(NSNumber *)newIndex
+               attemptId:(NSString *)attemptId
+                  result:(FlutterResult)result {
+    if (_processingState == psIdle || _processingState == psLoading || !CMTIME_IS_VALID(position) || !_indexedAudioSources) {
+        result(@{@"status": @"rejected"});
+        return;
+    }
+
+    int targetIndex = _index;
+    if (newIndex != (id)[NSNull null]) {
+        targetIndex = [newIndex intValue];
+    }
+    if (targetIndex < 0 || targetIndex >= (int)_indexedAudioSources.count) {
+        result(@{@"status": @"rejected"});
+        return;
+    }
+
+    [self advancePlaybackControlEpoch];
+    _confirmedSeekResult = result;
+    _confirmedSeekSourceEpoch = _playbackSourceEpoch;
+    _confirmedSeekControlEpoch = _playbackControlEpoch;
+    _confirmedSeekIndex = targetIndex;
+    _confirmedSeekAttemptId = [attemptId copy];
+    NSString *capturedAttemptId = [_confirmedSeekAttemptId copy];
+
+    [self seekInternal:position index:newIndex completionHandler:^(BOOL finished) {
+        if (!self->_confirmedSeekResult || ![self->_confirmedSeekAttemptId isEqualToString:capturedAttemptId]) {
+            return;
+        }
+        if (self->_confirmedSeekSourceEpoch != self->_playbackSourceEpoch
+                || self->_confirmedSeekControlEpoch != self->_playbackControlEpoch
+                || self->_confirmedSeekIndex != self->_index) {
+            [self completeConfirmedSeek:@"superseded" errorMessage:nil includeActualPosition:NO];
+            return;
+        }
+        if (!finished) {
+            [self completeConfirmedSeek:@"superseded" errorMessage:nil includeActualPosition:NO];
+            return;
+        }
+        [self completeConfirmedSeek:@"reached" errorMessage:nil includeActualPosition:YES];
+    }];
+}
+
 - (void)seek:(CMTime)position index:(NSNumber *)newIndex completionHandler:(void (^)(BOOL))completionHandler {
+    [self advancePlaybackControlEpoch];
+    [self seekInternal:position index:newIndex completionHandler:completionHandler];
+}
+
+- (void)seekInternal:(CMTime)position index:(NSNumber *)newIndex completionHandler:(void (^)(BOOL))completionHandler {
     if (_processingState == psIdle || _processingState == psLoading) {
         if (completionHandler) {
             completionHandler(NO);
@@ -1342,6 +1528,7 @@
 }
 
 - (void)dispose:(BOOL)calledFromDealloc {
+    [self advancePlaybackControlEpoch];
     if (!_player) return;
     if (_processingState != psIdle) {
         [_player pause];

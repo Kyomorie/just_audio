@@ -66,6 +66,14 @@ class MethodChannelAudioPlayer extends AudioPlayerPlatform {
   }
 
   @override
+  Future<AwaitPlaybackStartResponse> awaitPlaybackStart(
+      AwaitPlaybackStartRequest request) async {
+    return AwaitPlaybackStartResponse.fromMap(
+        (await _channel.invokeMethod<Map<dynamic, dynamic>>(
+            'awaitPlaybackStart', request.toMap()))!);
+  }
+
+  @override
   Future<PauseResponse> pause(PauseRequest request) async {
     return PauseResponse.fromMap((await _channel
         .invokeMethod<Map<dynamic, dynamic>>('pause', request.toMap()))!);
@@ -159,6 +167,14 @@ class MethodChannelAudioPlayer extends AudioPlayerPlatform {
   Future<SeekResponse> seek(SeekRequest request) async {
     return SeekResponse.fromMap((await _channel
         .invokeMethod<Map<dynamic, dynamic>>('seek', request.toMap()))!);
+  }
+
+  @override
+  Future<ConfirmedSeekResponse> seekConfirmed(
+      ConfirmedSeekRequest request) async {
+    return ConfirmedSeekResponse.fromMap(
+        (await _channel.invokeMethod<Map<dynamic, dynamic>>(
+            'seekConfirmed', request.toMap()))!);
   }
 
   @override

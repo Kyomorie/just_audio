@@ -293,6 +293,61 @@ void runTests() {
     await player.dispose();
   });
 
+  test('confirmed seek returns backend-reached position and index', () async {
+    final player = AudioPlayer();
+    await player.setAudioSources([
+      AudioSource.uri(Uri.parse('https://foo.foo/foo.mp3')),
+      AudioSource.uri(Uri.parse('https://bar.bar/bar.mp3')),
+    ]);
+    final platform = mock.mostRecentPlayer!
+      ..confirmedSeekActualPosition = const Duration(seconds: 3)
+      ..confirmedSeekActualIndex = 1;
+
+    final result = await player.seekConfirmed(
+      const Duration(seconds: 2),
+      index: 1,
+    );
+
+    expect(result.status, SeekConfirmationStatus.reached);
+    expect(result.actualPosition, const Duration(seconds: 3));
+    expect(result.actualIndex, 1);
+    expect(platform.confirmedSeekCallCount, 1);
+    await player.dispose();
+  });
+
+  test('confirmed seek rejects while loading without backend call', () async {
+    final player = AudioPlayer();
+    await player.setUrl('https://foo.foo/foo.mp3');
+    final platform = mock.mostRecentPlayer!;
+    platform.blockLoad();
+    final loadFuture = player.setUrl('https://bar.bar/bar.mp3');
+    await player.processingStateStream
+        .firstWhere((state) => state == ProcessingState.loading);
+
+    final result = await player.seekConfirmed(const Duration(seconds: 2));
+
+    expect(result.status, SeekConfirmationStatus.rejected);
+    expect(platform.confirmedSeekCallCount, 0);
+    platform.unblockLoad();
+    await loadFuture;
+    await player.dispose();
+  });
+
+  test('confirmed seek propagates superseded without claiming reach', () async {
+    final player = AudioPlayer();
+    await player.setUrl('https://foo.foo/foo.mp3');
+    final platform = mock.mostRecentPlayer!
+      ..confirmedSeekStatus = SeekConfirmationStatusMessage.superseded;
+
+    final result = await player.seekConfirmed(const Duration(seconds: 2));
+
+    expect(result.status, SeekConfirmationStatus.superseded);
+    expect(result.reached, isFalse);
+    expect(result.actualPosition, isNull);
+    expect(platform.confirmedSeekCallCount, 1);
+    await player.dispose();
+  });
+
   test('speed', () async {
     final player = AudioPlayer();
     /*final duration =*/ await player.setUrl('https://foo.foo/foo.mp3');
@@ -1689,11 +1744,103 @@ void runTests() {
     }
   });
 
+  test('backend playback start acknowledgment', () async {
+    final player = AudioPlayer();
+    await player.setUrl('https://foo.foo/foo.mp3');
+    final platform = mock.mostRecentPlayer!;
+
+    unawaited(player.play());
+    final result = await player.waitForPlaybackStart();
+
+    expect(result.status, PlaybackStartStatus.started);
+    expect(result.started, isTrue);
+    expect(platform.playCallCount, greaterThanOrEqualTo(1));
+    expect(platform.awaitPlaybackStartCallCount, 1);
+    expect(platform.lastPlaybackStartAttemptId, isNotEmpty);
+
+    await player.pause();
+    await player.dispose();
+  });
+
+  test('play completes when paused before native play dispatch', () async {
+    final player = AudioPlayer(handleAudioSessionActivation: false);
+    await player.setUrl('https://foo.foo/foo.mp3', preload: false);
+    final pauseCompleted = Completer<void>();
+    var pauseTriggered = false;
+    mock.onPlayerSetVolume = () {
+      if (pauseTriggered) return;
+      pauseTriggered = true;
+      unawaited(player.pause().whenComplete(() {
+        if (!pauseCompleted.isCompleted) pauseCompleted.complete();
+      }));
+    };
+
+    final playFuture = player.play();
+    await playFuture.timeout(const Duration(seconds: 2));
+    await pauseCompleted.future.timeout(const Duration(seconds: 2));
+    final platform = mock.mostRecentPlayer!;
+
+    expect(pauseTriggered, isTrue);
+    expect(player.playing, isFalse);
+    expect(platform.playCallCount, 0);
+
+    mock.onPlayerSetVolume = null;
+    await player.dispose();
+  });
+
+  test('playback start acknowledgment fails closed without native dispatch',
+      () async {
+    final player = AudioPlayer(handleAudioSessionActivation: false);
+
+    final playFuture = player.play();
+    final result = await player.waitForPlaybackStart();
+    await playFuture;
+
+    expect(result.status, PlaybackStartStatus.failed);
+    expect(result.started, isFalse);
+    expect(result.errorMessage, contains('not dispatched'));
+
+    await player.stop();
+    await player.dispose();
+  });
+
+  test('playback start acknowledgment rejects without play intent', () async {
+    final player = AudioPlayer();
+    await player.setUrl('https://foo.foo/foo.mp3');
+    final platform = mock.mostRecentPlayer!;
+
+    final result = await player.waitForPlaybackStart();
+
+    expect(result.status, PlaybackStartStatus.rejected);
+    expect(result.started, isFalse);
+    expect(platform.awaitPlaybackStartCallCount, 0);
+
+    await player.dispose();
+  });
+
+  test('playback start acknowledgment propagates superseded', () async {
+    final player = AudioPlayer();
+    await player.setUrl('https://foo.foo/foo.mp3');
+    final platform = mock.mostRecentPlayer!
+      ..playbackStartStatus = PlaybackStartStatusMessage.superseded;
+
+    unawaited(player.play());
+    final result = await player.waitForPlaybackStart();
+
+    expect(result.status, PlaybackStartStatus.superseded);
+    expect(result.started, isFalse);
+    expect(platform.awaitPlaybackStartCallCount, 1);
+
+    await player.pause();
+    await player.dispose();
+  });
+
   test('asyncMessages', () async {
     final player = AudioPlayer();
     await player.setUrl('https://foo.foo/foo.mp3');
     final platform = mock.mostRecentPlayer!;
     expect(player.playing, equals(false));
+    expect(player.effectivePlaying, equals(false));
     expect(player.volume, equals(1.0));
     expect(player.speed, equals(1.0));
     expect(player.pitch, equals(1.0));
@@ -1701,6 +1848,7 @@ void runTests() {
     expect(player.shuffleModeEnabled, equals(false));
     platform._broadcastDataMessage(PlayerDataMessage(
       playing: true,
+      effectivePlaying: true,
       volume: 0.7,
       speed: 0.8,
       pitch: 0.9,
@@ -1709,6 +1857,7 @@ void runTests() {
     ));
     await Future<void>.delayed(Duration.zero);
     expect(player.playing, equals(true));
+    expect(player.effectivePlaying, equals(true));
     expect(player.volume, equals(0.7));
     expect(player.speed, equals(0.8));
     expect(player.pitch, equals(0.9));
@@ -1723,6 +1872,7 @@ class MockJustAudio extends Mock
     implements JustAudioPlatform {
   MockAudioPlayer? mostRecentPlayer;
   final _players = <String, MockAudioPlayer>{};
+  void Function()? onPlayerSetVolume;
 
   @override
   Future<AudioPlayerPlatform> init(InitRequest request) async {
@@ -1731,7 +1881,7 @@ class MockJustAudio extends Mock
           code: "error",
           message: "Platform player ${request.id} already exists");
     }
-    final player = MockAudioPlayer(request);
+    final player = MockAudioPlayer(request)..onSetVolume = onPlayerSetVolume;
     _players[request.id] = player;
     mostRecentPlayer = player;
     return player;
@@ -1808,6 +1958,19 @@ class MockAudioPlayer extends AudioPlayerPlatform {
   int? _errorCode;
   String? _errorMessage;
   Completer<void>? _loadBlock;
+  PlaybackStartStatusMessage playbackStartStatus =
+      PlaybackStartStatusMessage.started;
+  String? playbackStartErrorMessage;
+  int awaitPlaybackStartCallCount = 0;
+  String? lastPlaybackStartAttemptId;
+  int playCallCount = 0;
+  SeekConfirmationStatusMessage confirmedSeekStatus =
+      SeekConfirmationStatusMessage.reached;
+  Duration? confirmedSeekActualPosition;
+  int? confirmedSeekActualIndex;
+  String? confirmedSeekErrorMessage;
+  int confirmedSeekCallCount = 0;
+  void Function()? onSetVolume;
 
   MockAudioPlayer(InitRequest request)
       : audioLoadConfiguration = request.audioLoadConfiguration,
@@ -1902,6 +2065,7 @@ class MockAudioPlayer extends AudioPlayerPlatform {
 
   @override
   Future<PlayResponse> play(PlayRequest request) async {
+    playCallCount++;
     if (_playing) return PlayResponse();
     _playing = true;
     if (_duration != null) {
@@ -1924,6 +2088,19 @@ class MockAudioPlayer extends AudioPlayerPlatform {
   }
 
   @override
+  Future<AwaitPlaybackStartResponse> awaitPlaybackStart(
+      AwaitPlaybackStartRequest request) async {
+    awaitPlaybackStartCallCount++;
+    lastPlaybackStartAttemptId = request.attemptId;
+    return AwaitPlaybackStartResponse(
+      status: playCallCount == 0
+          ? PlaybackStartStatusMessage.rejected
+          : playbackStartStatus,
+      errorMessage: playbackStartErrorMessage,
+    );
+  }
+
+  @override
   Future<PauseResponse> pause(PauseRequest request) async {
     if (!_playing) return PauseResponse();
     _setPosition(_position);
@@ -1940,6 +2117,31 @@ class MockAudioPlayer extends AudioPlayerPlatform {
     _index = request.index ?? 0;
     _broadcastPlaybackEvent();
     return SeekResponse();
+  }
+
+  @override
+  Future<ConfirmedSeekResponse> seekConfirmed(
+      ConfirmedSeekRequest request) async {
+    confirmedSeekCallCount++;
+    final actualPosition =
+        confirmedSeekActualPosition ?? request.position ?? Duration.zero;
+    final actualIndex = confirmedSeekActualIndex ?? request.index ?? _index;
+    if (confirmedSeekStatus == SeekConfirmationStatusMessage.reached) {
+      _setPosition(actualPosition);
+      _index = actualIndex;
+      _broadcastPlaybackEvent();
+    }
+    return ConfirmedSeekResponse(
+      status: confirmedSeekStatus,
+      actualPosition:
+          confirmedSeekStatus == SeekConfirmationStatusMessage.reached
+              ? actualPosition
+              : null,
+      actualIndex: confirmedSeekStatus == SeekConfirmationStatusMessage.reached
+          ? actualIndex
+          : null,
+      errorMessage: confirmedSeekErrorMessage,
+    );
   }
 
   Future<void> _autoAdvance() async {
@@ -2001,6 +2203,7 @@ class MockAudioPlayer extends AudioPlayerPlatform {
 
   @override
   Future<SetVolumeResponse> setVolume(SetVolumeRequest request) async {
+    onSetVolume?.call();
     return SetVolumeResponse();
   }
 
